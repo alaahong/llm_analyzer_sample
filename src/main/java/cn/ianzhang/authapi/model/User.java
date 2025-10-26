@@ -46,7 +46,7 @@ public class User {
         if (o == null || getClass() != o.getClass()) return false;
         User user = (User) o;
         return Objects.equals(username, user.username) &&
-               Objects.equals(email, user.email);
+                Objects.equals(email, user.email);
     }
 
     @Override
@@ -57,8 +57,8 @@ public class User {
     @Override
     public String toString() {
         return "User{" +
-               "username='" + username + '\'' +
-               ", email='" + email + '\'' +
-               '}';
+                "username='" + username + '\'' +
+                ", email='" + email + '\'' +
+                '}';
     }
 }

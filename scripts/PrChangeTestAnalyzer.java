@@ -281,7 +281,7 @@ public class PrChangeTestAnalyzer {
     private static TestResult runMavenTests(List<String> simpleClassNames) throws IOException, InterruptedException {
         if (simpleClassNames.isEmpty()) return TestResult.noTests("No Maven tests selected.");
         String testProp = String.join(",", simpleClassNames);
-        String cmd = "mvn -B -DskipITs=true -DfailIfNoTests=false -Dtest=" + shellQuote(testProp) + " test";
+        String cmd = "mvn -B -DskipITs=true -DfailIfNoTests=false -Dtest=" + shellQuote(testProp) + "  -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition test";
         ExecResult er = execute(new String[]{"bash", "-lc", cmd});
         return new TestResult(true, er.exitCode, cmd, er.stdout, "maven");
     }
