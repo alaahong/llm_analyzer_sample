@@ -12,7 +12,7 @@ public class UserService {
     private final Map<String, String> sessionStore = new ConcurrentHashMap<>();
 
     // 注册新用户
-    public boolean register(User user) {
+    public  Boolean register(User user) {
         // 检查用户名是否已存在
         if (userStore.containsKey(user.getUsername())) {
             return false;
