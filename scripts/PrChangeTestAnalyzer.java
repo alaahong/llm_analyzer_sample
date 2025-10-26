@@ -1,16 +1,16 @@
 /* Java 21 PR Targeted Test Analyzer with OpenRouter suggestions and rule-based fallback.
- * - On PR events, list changed source files.
- * - Heuristically map them to unit test files/classes (Java/Maven/Gradle focus), verify existence, and run only those tests.
- * - Summarize results and show focused failure snippets only when tests fail, then post a PR comment.
- * - If OPENROUTER_API_KEY is present, call OpenRouter to propose additional tests and fixes based on highlights.
- * - If LLM is unavailable, fall back to built-in rules for quick suggestions.
+ * Spring Boot enhanced mapping:
+ *  - From changed src/main/java FQN -> find tests by:
+ *      * Heuristic name mapping: FooTest/TestFoo/FooTests
+ *      * Same-package test discovery under src/test/java/<pkgDir>/**
+ *      * Reference scanning in tests: import FQN, FQN.class, new <ClassName>(...),
+ *        @WebMvcTest(<Class>.class), @MockBean(<Class>.class), @Autowired <ClassName>
+ *  - De-duplicate candidate test files and class names.
+ *  - Only show focused failure diagnostics when tests fail.
  *
- * Notes:
- * - Primarily for Java projects:
- *   * Maven: maps src/main/java/...Foo.java -> src/test/java/...FooTest|TestFoo|FooTests.java, runs with -Dtest=...
- *   * Gradle: same mapping; runs with --tests SimpleClassName
- * - From forks, secrets may not be available; script still comments with rule-based suggestions.
- * - Optional failing behavior: set FAIL_ON_TEST_FAILURE=true to fail the job when targeted tests fail.
+ * Optional:
+ *  - OPENROUTER_API_KEY + OPENROUTER_MODEL for AI suggestions; otherwise rule-based suggestions.
+ *  - FAIL_ON_TEST_FAILURE=true to fail the job if selected tests fail.
  */
 import java.io.*;
 import java.net.URI;
@@ -38,23 +38,22 @@ public class PrChangeTestAnalyzer {
             String apiUrl = getenvOr("API_URL", "https://api.github.com");
             String workflowName = getenvOr("WORKFLOW_NAME", "PR Targeted Test Analyzer");
 
-            String provider = "openrouter";
             String orKey = getenvOr("OPENROUTER_API_KEY", "").trim();
             String orModel = getenvOr("OPENROUTER_MODEL", "meta-llama/llama-3.3-8b-instruct:free").trim();
             int llmMax = parseIntSafe(getenvOr("LLM_MAX_TOKENS", "800"), 800);
             boolean failOnTestFailure = "true".equalsIgnoreCase(getenvOr("FAIL_ON_TEST_FAILURE", "true"));
 
-            // 1) Gather PR file changes
+            // 1) Gather changed files in PR
             List<ChangedFile> changed = listChangedFiles(repo, prNum);
             String changedFilesBlock = changed.isEmpty()
                     ? "(no files reported by the API)"
                     : changed.stream().map(cf -> "- " + cf.status + " " + cf.filename).collect(Collectors.joining("\n"));
 
-            // 2) Heuristic mapping and plan
+            // 2) Detect project type and build enhanced Spring Boot test plan
             ProjectType projectType = detectProjectType();
-            TestPlan testPlan = buildTestPlan(changed, projectType);
+            TestPlan testPlan = buildSpringBootEnhancedTestPlan(changed, projectType);
 
-            // 3) Execute tests (targeted; if none found, skip but comment)
+            // 3) Execute selected tests
             TestResult testResult;
             if (!testPlan.testClasses.isEmpty()) {
                 if (projectType == ProjectType.MAVEN) {
@@ -65,26 +64,25 @@ public class PrChangeTestAnalyzer {
                     testResult = TestResult.noProject("No supported build tool detected (no pom.xml or gradlew).");
                 }
             } else {
-                testResult = TestResult.noTests("No targeted unit tests matched heuristics. Skipping selective run.");
+                testResult = TestResult.noTests("No targeted unit tests matched mapping. Skipping selective run.");
             }
 
             if (testResult.executed && testResult.exitCode != 0 && failOnTestFailure) {
-                intendedExit = 1; // mark for failing at the end
+                intendedExit = 1; // defer failing until after commenting
             }
 
-            // 4) Failure diagnostics: only when tests fail
+            // 4) Failure diagnostics only when tests fail
             String failureDiagnostics = "";
             if (testResult.executed && testResult.exitCode != 0) {
                 failureDiagnostics = collectFailureDiagnostics();
                 if (isBlank(failureDiagnostics)) {
-                    // fallback to generic highlights from console + reports tail
                     String reportsTail = readTestReportsTail();
                     String combined = trimTo(testResult.log, 40_000) + "\n" + reportsTail;
                     failureDiagnostics = extractErrorHighlights(combined, HIGHLIGHT_MAX_LINES);
                 }
             }
 
-            // 5) Summary and LLM suggestions
+            // 5) Summary + suggestions
             String reportsTailForSummary = readTestReportsTail();
             String summary = summarizeResults(testResult, reportsTailForSummary);
 
@@ -96,13 +94,13 @@ public class PrChangeTestAnalyzer {
                 llmAnalysis = ruleBasedSuggestions(failureDiagnostics);
             }
 
-            // 6) Compose PR comment
+            // 6) PR comment
             String prUrl = serverUrl + "/" + repo + "/pull/" + prNum;
             StringBuilder body = new StringBuilder();
-            body.append("🤖 PR Targeted Test Analyzer\n\n");
+            body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced)\n\n");
             body.append("- PR: ").append(prUrl).append("\n");
             body.append("- Build tool: ").append(projectType).append("\n");
-            body.append("- Selected tests (heuristics): ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
+            body.append("- Selected tests (enhanced mapping): ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
             body.append("- Test command: ").append(testResult.command).append("\n");
             body.append("- Test exit code: ").append(testResult.executed ? testResult.exitCode : "(n/a)").append("\n");
             if (failOnTestFailure) body.append("- Fail-on-test-failure: enabled\n");
@@ -110,13 +108,12 @@ public class PrChangeTestAnalyzer {
 
             body.append("Changed files:\n```\n").append(changedFilesBlock).append("\n```\n\n");
             if (!testPlan.candidateTestsListing.isBlank()) {
-                body.append("Candidate test files (mapped and existing):\n```\n")
+                body.append("Candidate test files (mapped and existing, de-duplicated):\n```\n")
                         .append(testPlan.candidateTestsListing).append("\n```\n\n");
             }
 
             body.append("Test summary:\n```\n").append(summary).append("\n```\n\n");
 
-            // Only show diagnostics on failure
             if (testResult.executed && testResult.exitCode != 0 && !isBlank(failureDiagnostics)) {
                 body.append("Failure diagnostics (focused snippets):\n```txt\n")
                         .append(failureDiagnostics).append("\n```\n\n");
@@ -130,58 +127,35 @@ public class PrChangeTestAnalyzer {
                 finalBody = finalBody.substring(0, BODY_MAX_CHARS) + "\n\n…(truncated)…";
             }
 
-            // 7) Post comment to PR
             Path tmp = Files.createTempFile("pr-test-analyzer-", ".md");
             Files.writeString(tmp, finalBody, StandardCharsets.UTF_8);
             postPrComment(repo, prNum, tmp);
 
-            // Optional: enforce failure after commenting
             if (intendedExit != 0) System.exit(intendedExit);
             System.out.println("Posted PR analysis and test results.");
         } catch (Exception e) {
             System.err.println("Failed to run PR analyzer: " + e);
-            // Do not fail the job to avoid blocking PR by default
             System.exit(0);
         }
     }
 
-    // ---------------- Data models ----------------
+    // ========= Data models =========
     enum ProjectType { MAVEN, GRADLE, UNKNOWN }
-
-    static class ChangedFile {
-        final String filename;
-        final String status;
-        ChangedFile(String filename, String status) { this.filename = filename; this.status = status; }
-    }
-
+    static class ChangedFile { final String filename; final String status; ChangedFile(String f, String s){ filename=f; status=s; } }
     static class TestPlan {
         final ProjectType projectType;
-        final List<String> testClasses; // simple class names to pass to runner
-        final String candidateTestsListing; // pretty listing (de-duplicated)
-        TestPlan(ProjectType t, List<String> cls, String listing) {
-            this.projectType = t; this.testClasses = cls; this.candidateTestsListing = listing == null ? "" : listing;
-        }
+        final List<String> testClasses;          // simple class names to pass to runner
+        final String candidateTestsListing;      // pretty listing (de-duplicated)
+        TestPlan(ProjectType t, List<String> c, String l){ projectType=t; testClasses=c; candidateTestsListing=l==null?"":l; }
     }
-
     static class TestResult {
-        final boolean executed;
-        final int exitCode;
-        final String command;
-        final String log;
-        final String tool;
-
-        TestResult(boolean executed, int exitCode, String command, String log, String tool) {
-            this.executed = executed;
-            this.exitCode = exitCode;
-            this.command = command;
-            this.log = log;
-            this.tool = tool;
-        }
-        static TestResult noTests(String msg) { return new TestResult(false, 0, "(no tests executed)", msg, "(none)"); }
-        static TestResult noProject(String msg) { return new TestResult(false, 0, "(no project detected)", msg, "(none)"); }
+        final boolean executed; final int exitCode; final String command; final String log; final String tool;
+        TestResult(boolean ex, int ec, String cmd, String lg, String tl){ executed=ex; exitCode=ec; command=cmd; log=lg; tool=tl; }
+        static TestResult noTests(String msg){ return new TestResult(false,0,"(no tests executed)",msg,"(none)"); }
+        static TestResult noProject(String msg){ return new TestResult(false,0,"(no project detected)",msg,"(none)"); }
     }
 
-    // ---------------- Step 1: list changed files ----------------
+    // ========= Step 1: changed files =========
     private static List<ChangedFile> listChangedFiles(String repo, String prNum) throws IOException, InterruptedException {
         List<ChangedFile> out = new ArrayList<>();
         int page = 1;
@@ -190,106 +164,127 @@ public class PrChangeTestAnalyzer {
             Pattern p = Pattern.compile("\"filename\"\\s*:\\s*\"([^\"]+)\".*?\"status\"\\s*:\\s*\"([^\"]+)\"", Pattern.DOTALL);
             Matcher m = p.matcher(json);
             boolean any = false;
-            while (m.find()) {
-                any = true;
-                out.add(new ChangedFile(m.group(1), m.group(2)));
-            }
+            while (m.find()) { any = true; out.add(new ChangedFile(m.group(1), m.group(2))); }
             if (!any || json.length() < 10 || !json.contains("\"filename\"")) break;
             page++;
         }
         return out;
     }
 
-    // ---------------- Step 2: build test plan ----------------
+    // ========= Step 2: enhanced Spring Boot mapping =========
     private static ProjectType detectProjectType() {
         if (Files.exists(Path.of("pom.xml"))) return ProjectType.MAVEN;
         if (Files.exists(Path.of("gradlew"))) return ProjectType.GRADLE;
         return ProjectType.UNKNOWN;
     }
 
-    private static TestPlan buildTestPlan(List<ChangedFile> changed, ProjectType type) throws IOException {
-        if (type == ProjectType.MAVEN || type == ProjectType.GRADLE) {
-            return buildJavaTestPlan(changed);
-        } else {
-            return new TestPlan(type, List.of(), "");
-        }
-    }
+    private static TestPlan buildSpringBootEnhancedTestPlan(List<ChangedFile> changed, ProjectType type) throws IOException, InterruptedException {
+        if (type == ProjectType.UNKNOWN) return new TestPlan(type, List.of(), "");
 
-    private static TestPlan buildJavaTestPlan(List<ChangedFile> changed) throws IOException {
-        Set<String> classNames = new LinkedHashSet<>();
-        LinkedHashSet<String> listingPaths = new LinkedHashSet<>(); // de-duplicate candidate paths
+        LinkedHashSet<String> listingPaths = new LinkedHashSet<>();   // unique test file paths
+        LinkedHashSet<String> simpleNames = new LinkedHashSet<>();    // unique simple class names
 
         for (ChangedFile cf : changed) {
             if (!cf.filename.endsWith(".java")) continue;
 
-            // Map src/main/java/.../Foo.java -> candidate tests under src/test/java/...:
+            // 2.1 If test file changed, include it directly
+            if (cf.filename.startsWith("src/test/java/")) {
+                listingPaths.add(cf.filename);
+                addSimpleNameFromTestPath(simpleNames, cf.filename);
+                continue;
+            }
+
+            // 2.2 If main code changed, build FQN and mapping
             if (cf.filename.startsWith("src/main/java/")) {
                 String rel = cf.filename.substring("src/main/java/".length());
-                if (rel.endsWith(".java")) rel = rel.substring(0, rel.length() - 5);
-                String leaf = rel.contains("/") ? rel.substring(rel.lastIndexOf('/') + 1) : rel;
-                String pkgDir = rel.contains("/") ? rel.substring(0, rel.lastIndexOf('/')) : "";
+                if (!rel.endsWith(".java")) continue;
+                String relNoExt = rel.substring(0, rel.length() - 5);
+                String leaf = relNoExt.contains("/") ? relNoExt.substring(relNoExt.lastIndexOf('/') + 1) : relNoExt;
+                String pkgDir = relNoExt.contains("/") ? relNoExt.substring(0, relNoExt.lastIndexOf('/')) : "";
+                String fqn = relNoExt.replace('/', '.');
 
-                List<String> candidates = List.of(
+                // A) Heuristic test names
+                List<String> heuristics = List.of(
                         "src/test/java/" + pkgDir + "/" + leaf + "Test.java",
                         "src/test/java/" + pkgDir + "/" + "Test" + leaf + ".java",
                         "src/test/java/" + pkgDir + "/" + leaf + "Tests.java"
                 );
-
-                List<String> found = new ArrayList<>();
-                for (String c : candidates) {
-                    if (Files.exists(Path.of(c))) found.add(c);
+                for (String h : heuristics) {
+                    if (Files.exists(Path.of(h))) {
+                        listingPaths.add(h);
+                        addSimpleNameFromTestPath(simpleNames, h);
+                    }
                 }
 
-                if (found.isEmpty()) {
-                    // Grep tests for references to leaf
-                    List<String> grepHits = grepTestReferences("src/test/java", leaf);
-                    found.addAll(grepHits);
-                }
+                // B) Same-package tests (include subpackages) for Spring slices/integration
+                addAllTestsUnderPackage(listingPaths, simpleNames, pkgDir);
 
-                for (String f : found) {
-                    listingPaths.add(f);
-                    String simple = toSimpleClassNameFromPath(f, "src/test/java/");
-                    if (!simple.isBlank()) classNames.add(simple);
-                }
-            }
-
-            // If a test file itself changed, include it
-            if (cf.filename.startsWith("src/test/java/") && cf.filename.endsWith(".java")) {
-                listingPaths.add(cf.filename);
-                String simple = toSimpleClassNameFromPath(cf.filename, "src/test/java/");
-                if (!simple.isBlank()) classNames.add(simple);
+                // C) Reference scanning in test sources (import/FQN.class/new/@WebMvcTest/@MockBean/@Autowired)
+                addRefScannedTests(listingPaths, simpleNames, fqn, leaf);
             }
         }
 
         String listing = listingPaths.stream().collect(Collectors.joining("\n"));
-        return new TestPlan(ProjectType.MAVEN, new ArrayList<>(classNames), listing);
+        return new TestPlan(ProjectType.MAVEN, new ArrayList<>(simpleNames), listing);
     }
 
-    private static String toSimpleClassNameFromPath(String path, String testRootPrefix) {
-        if (!path.startsWith(testRootPrefix)) return "";
-        String leaf = path.substring(path.lastIndexOf('/') + 1);
-        if (!leaf.endsWith(".java")) return "";
-        return leaf.substring(0, leaf.length() - 5);
+    private static void addSimpleNameFromTestPath(Set<String> simpleNames, String testPath) {
+        String leaf = testPath.substring(testPath.lastIndexOf('/') + 1);
+        if (leaf.endsWith(".java")) {
+            simpleNames.add(leaf.substring(0, leaf.length() - 5));
+        }
     }
 
-    private static List<String> grepTestReferences(String root, String classLeafName) throws IOException {
-        List<String> results = new ArrayList<>();
-        String[] cmd = new String[]{"bash", "-lc",
+    private static void addAllTestsUnderPackage(Set<String> listingPaths, Set<String> simpleNames, String pkgDir) throws IOException {
+        // src/test/java/<pkgDir>/**  where filename matches *Test.java or *Tests.java
+        Path root = Path.of("src", "test", "java").resolve(pkgDir);
+        if (!Files.exists(root)) return;
+        try (var walk = Files.walk(root)) {
+            for (Path p : walk.filter(Files::isRegularFile).toList()) {
+                String s = p.toString().replace('\\', '/');
+                if (s.endsWith("Test.java") || s.endsWith("Tests.java")) {
+                    listingPaths.add(s);
+                    addSimpleNameFromTestPath(simpleNames, s);
+                }
+            }
+        }
+    }
+
+    private static void addRefScannedTests(Set<String> listingPaths, Set<String> simpleNames, String fqn, String leaf) throws IOException, InterruptedException {
+        // Build grep patterns
+        // - import <fqn>
+        // - <fqn>.class
+        // - @WebMvcTest(<leaf>.class) / @MockBean(<leaf>.class)
+        // - @Autowired <leaf>
+        // - new <leaf>(
+        String pattern = String.join("|", List.of(
+                Pattern.quote("import " + fqn),
+                Pattern.quote(fqn + ".class"),
+                "@WebMvcTest\\s*\\(.*\\b" + Pattern.quote(leaf) + "\\s*\\.\\s*class\\b.*\\)",
+                "@MockBean\\s*\\(.*\\b" + Pattern.quote(leaf) + "\\s*\\.\\s*class\\b.*\\)",
+                "@Autowired\\s+[^;\\n]*\\b" + Pattern.quote(leaf) + "\\b",
+                "\\bnew\\s+" + Pattern.quote(leaf) + "\\s*\\("
+        ));
+
+        String cmd = "bash -lc " + shellQuote(
                 "set -o pipefail; " +
                         "if command -v grep >/dev/null 2>&1; then " +
-                        "grep -RIl --include='*.java' -e '\\b" + escapeShell(classLeafName) + "\\b' " + escapeShell(root) + " || true; " +
+                        "grep -RIl --include='*.java' -E '" + pattern + "' src/test/java || true; " +
                         "fi"
-        };
-        try {
-            String out = runProcess(cmd);
-            for (String line : out.split("\\R")) {
-                if (!line.isBlank()) results.add(line.trim());
+        );
+        String out = runProcess(new String[]{"bash", "-lc", cmd});
+        for (String line : out.split("\\R")) {
+            String p = line.trim();
+            if (p.isEmpty()) continue;
+            String norm = p.replace('\\', '/');
+            if (norm.endsWith(".java")) {
+                listingPaths.add(norm);
+                addSimpleNameFromTestPath(simpleNames, norm);
             }
-        } catch (Exception ignored) {}
-        return results;
+        }
     }
 
-    // ---------------- Step 3: run tests ----------------
+    // ========= Step 3: run tests =========
     private static TestResult runMavenTests(List<String> simpleClassNames) throws IOException, InterruptedException {
         if (simpleClassNames.isEmpty()) return TestResult.noTests("No Maven tests selected.");
         String testProp = String.join(",", simpleClassNames);
@@ -314,13 +309,11 @@ public class PrChangeTestAnalyzer {
         sb.append("exitCode: ").append(r.executed ? r.exitCode : "(n/a)").append("\n");
         sb.append("command: ").append(r.command).append("\n\n");
 
-        // Try to extract surefire-like summaries from console
         Pattern p = Pattern.compile("(?im)Results?:\\s*|Tests run:\\s*\\d+\\s*,.*|Failures:\\s*\\d+.*|Errors:\\s*\\d+.*|Skipped:\\s*\\d+.*");
         Matcher m = p.matcher(r.log);
         List<String> lines = new ArrayList<>();
         while (m.find()) lines.add(m.group());
         if (lines.isEmpty()) {
-            // fallback: tail from reports
             String[] arr = reportsTail.split("\\R");
             int start = Math.max(0, arr.length - 80);
             for (int i = start; i < arr.length; i++) lines.add(arr[i]);
@@ -329,24 +322,18 @@ public class PrChangeTestAnalyzer {
         return sb.toString();
     }
 
-    // ---------------- Failure diagnostics (focused) ----------------
+    // ========= Failure diagnostics =========
     private static String collectFailureDiagnostics() throws IOException {
-        // Prefer JUnit XML details
         List<String> snippets = new ArrayList<>();
-
-        // surefire/failsafe XML
         collectJUnitXmlFailures(snippets, Path.of("target", "surefire-reports"));
         collectJUnitXmlFailures(snippets, Path.of("target", "failsafe-reports"));
-        // Gradle test-results
         collectJUnitXmlFailures(snippets, Path.of("build", "test-results", "test"));
 
-        // If no XML diagnostics, try surefire/failsafe text files
         if (snippets.isEmpty()) {
             collectSurefireTxtFailures(snippets, Path.of("target", "surefire-reports"));
             collectSurefireTxtFailures(snippets, Path.of("target", "failsafe-reports"));
         }
 
-        // Limit number and size
         if (snippets.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         int limit = Math.min(3, snippets.size());
@@ -363,7 +350,6 @@ public class PrChangeTestAnalyzer {
         try (var walk = Files.walk(dir)) {
             for (Path p : walk.filter(Files::isRegularFile).filter(x -> x.toString().endsWith(".xml")).toList()) {
                 String xml = Files.readString(p, StandardCharsets.UTF_8);
-                // Match <testcase ... name="..." classname="..."> ... <failure ...>...</failure> ... </testcase>
                 Pattern tc = Pattern.compile(
                         "<testcase\\b[^>]*?classname=\"([^\"]*)\"[^>]*?name=\"([^\"]*)\"[^>]*?>([\\s\\S]*?)</testcase>",
                         Pattern.CASE_INSENSITIVE);
@@ -397,7 +383,6 @@ public class PrChangeTestAnalyzer {
                 for (int i = 0; i < lines.size(); i++) {
                     String ln = lines.get(i);
                     if (marker.matcher(ln).find()) {
-                        // capture around the marker
                         int start = Math.max(0, i - 5);
                         int end = Math.min(lines.size(), i + 60);
                         String block = String.join("\n", lines.subList(start, end));
@@ -409,7 +394,7 @@ public class PrChangeTestAnalyzer {
         }
     }
 
-    // ---------------- Step 5: OpenRouter or rules ----------------
+    // ========= LLM or rule-based =========
     private static String analyzeWithOpenRouter(String key, String model, String prompt, int maxTokens) {
         try {
             HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
@@ -506,7 +491,7 @@ public class PrChangeTestAnalyzer {
         return "```\n" + sb.toString().trim() + "\n```";
     }
 
-    // ---------------- Comment posting ----------------
+    // ========= PR comment & helpers =========
     private static void postPrComment(String repo, String prNumber, Path bodyFile) throws IOException, InterruptedException {
         runProcess(new String[]{
                 "gh", "pr", "comment", prNumber,
@@ -515,7 +500,6 @@ public class PrChangeTestAnalyzer {
         });
     }
 
-    // ---------------- Utilities ----------------
     private static String readTestReportsTail() throws IOException {
         StringBuilder sb = new StringBuilder();
         try (var walk = Files.walk(Path.of("."))) {
@@ -600,27 +584,15 @@ public class PrChangeTestAnalyzer {
     private static String shellQuote(String s) { return "'" + s.replace("'", "'\"'\"'") + "'"; }
     private static String escapeShell(String s) { return s.replace("'", "'\"'\"'"); }
 
-    private static String jsonString(String s) {
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
-    }
+    private static String jsonString(String s) { return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""; }
     private static String extractJsonField(String json, String field) {
         String key = "\"" + field + "\"";
-        int i = json.indexOf(key);
-        if (i < 0) return "";
-        int colon = json.indexOf(':', i + key.length());
-        if (colon < 0) return "";
-        int startQuote = json.indexOf('"', colon + 1);
-        if (startQuote < 0) return "";
-        int end = startQuote + 1;
-        boolean escape = false;
-        while (end < json.length()) {
-            char c = json.charAt(end);
-            if (c == '"' && !escape) break;
-            escape = (c == '\\') && !escape;
-            end++;
-        }
-        if (end >= json.length()) return "";
-        String val = json.substring(startQuote + 1, end);
+        int i = json.indexOf(key); if (i < 0) return "";
+        int colon = json.indexOf(':', i + key.length()); if (colon < 0) return "";
+        int startQuote = json.indexOf('"', colon + 1); if (startQuote < 0) return "";
+        int end = startQuote + 1; boolean escape = false;
+        while (end < json.length()) { char c = json.charAt(end); if (c == '"' && !escape) break; escape = (c == '\\') && !escape; end++; }
+        if (end >= json.length()) return ""; String val = json.substring(startQuote + 1, end);
         return val.replace("\\n", "\n").replace("\\\"", "\"");
     }
 
@@ -629,17 +601,10 @@ public class PrChangeTestAnalyzer {
         if (v == null || v.isBlank()) throw new IllegalStateException("Missing environment variable: " + key);
         return v;
     }
-
     private static String getenvOr(String key, String def) {
         String v = System.getenv(key);
         return (v == null || v.isBlank()) ? def : v;
     }
-
-    private static int parseIntSafe(String s, int def) {
-        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
-    }
-
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
+    private static int parseIntSafe(String s, int def) { try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; } }
+    private static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); }
 }
