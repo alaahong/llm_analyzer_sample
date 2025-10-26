@@ -1,16 +1,18 @@
 /* Java 21 PR Targeted Test Analyzer with OpenRouter suggestions and rule-based fallback.
- * Spring Boot enhanced mapping:
- *  - From changed src/main/java FQN -> find tests by:
+ * Spring Boot enhanced mapping + affected API endpoints:
+ *  - From changed src/main/java FQN -> find tests and affected controllers by:
  *      * Heuristic name mapping: FooTest/TestFoo/FooTests
  *      * Same-package test discovery under src/test/java/<pkgDir>/**
- *      * Reference scanning in tests: import FQN, FQN.class, new <ClassName>(...),
- *        @WebMvcTest(<Class>.class), @MockBean(<Class>.class), @Autowired <ClassName>
- *  - De-duplicate candidate test files and class names.
- *  - Only show focused failure diagnostics when tests fail.
+ *      * Reference scanning in tests and controllers
+ *  - Parse Spring MVC annotations to build endpoints (class + method level).
+ *  - De-duplicate candidate test files and endpoints; only show focused failure diagnostics on failures.
  *
- * Optional:
- *  - OPENROUTER_API_KEY + OPENROUTER_MODEL for AI suggestions; otherwise rule-based suggestions.
- *  - FAIL_ON_TEST_FAILURE=true to fail the job if selected tests fail.
+ * Defaults requested:
+ *  - OpenRouter model default: meta-llama/llama-3.3-8b-instruct:free
+ *  - FAIL_ON_TEST_FAILURE default: true
+ *  - WORKFLOW_NAME default: "PR Targeted Test Analyzer"
+ *  - Maven test command disables JUnit @Disabled via:
+ *      -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition
  */
 import java.io.*;
 import java.net.URI;
@@ -43,17 +45,20 @@ public class PrChangeTestAnalyzer {
             int llmMax = parseIntSafe(getenvOr("LLM_MAX_TOKENS", "800"), 800);
             boolean failOnTestFailure = "true".equalsIgnoreCase(getenvOr("FAIL_ON_TEST_FAILURE", "true"));
 
-            // 1) Gather changed files in PR
+            // 1) PR changed files
             List<ChangedFile> changed = listChangedFiles(repo, prNum);
             String changedFilesBlock = changed.isEmpty()
                     ? "(no files reported by the API)"
                     : changed.stream().map(cf -> "- " + cf.status + " " + cf.filename).collect(Collectors.joining("\n"));
 
-            // 2) Detect project type and build enhanced Spring Boot test plan
+            // 2) Project type and Spring Boot enhanced mapping for tests
             ProjectType projectType = detectProjectType();
             TestPlan testPlan = buildSpringBootEnhancedTestPlan(changed, projectType);
 
-            // 3) Execute selected tests
+            // 3) Affected API endpoints (Spring MVC)
+            List<Endpoint> endpoints = detectAffectedEndpoints(changed);
+
+            // 4) Execute selected tests
             TestResult testResult;
             if (!testPlan.testClasses.isEmpty()) {
                 if (projectType == ProjectType.MAVEN) {
@@ -66,12 +71,9 @@ public class PrChangeTestAnalyzer {
             } else {
                 testResult = TestResult.noTests("No targeted unit tests matched mapping. Skipping selective run.");
             }
+            if (testResult.executed && testResult.exitCode != 0 && failOnTestFailure) intendedExit = 1;
 
-            if (testResult.executed && testResult.exitCode != 0 && failOnTestFailure) {
-                intendedExit = 1; // defer failing until after commenting
-            }
-
-            // 4) Failure diagnostics only when tests fail
+            // 5) Failure diagnostics only when tests fail
             String failureDiagnostics = "";
             if (testResult.executed && testResult.exitCode != 0) {
                 failureDiagnostics = collectFailureDiagnostics();
@@ -82,7 +84,7 @@ public class PrChangeTestAnalyzer {
                 }
             }
 
-            // 5) Summary + suggestions
+            // 6) Summary + suggestions
             String reportsTailForSummary = readTestReportsTail();
             String summary = summarizeResults(testResult, reportsTailForSummary);
 
@@ -94,10 +96,10 @@ public class PrChangeTestAnalyzer {
                 llmAnalysis = ruleBasedSuggestions(failureDiagnostics);
             }
 
-            // 6) PR comment
+            // 7) Compose PR comment
             String prUrl = serverUrl + "/" + repo + "/pull/" + prNum;
             StringBuilder body = new StringBuilder();
-            body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced)\n\n");
+            body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced + API endpoints)\n\n");
             body.append("- PR: ").append(prUrl).append("\n");
             body.append("- Build tool: ").append(projectType).append("\n");
             body.append("- Selected tests (enhanced mapping): ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
@@ -110,6 +112,19 @@ public class PrChangeTestAnalyzer {
             if (!testPlan.candidateTestsListing.isBlank()) {
                 body.append("Candidate test files (mapped and existing, de-duplicated):\n```\n")
                         .append(testPlan.candidateTestsListing).append("\n```\n\n");
+            }
+
+            if (!endpoints.isEmpty()) {
+                body.append("Affected API endpoints (detected):\n```\n");
+                LinkedHashSet<String> lines = new LinkedHashSet<>();
+                for (Endpoint ep : endpoints) {
+                    String line = String.format("- [%s] %s -> %s#%s (%s)",
+                            ep.httpMethod, ep.path, ep.controllerSimple, isBlank(ep.methodName) ? "<unknown>" : ep.methodName, ep.reason);
+                    lines.add(line);
+                }
+                body.append(String.join("\n", lines)).append("\n```\n\n");
+            } else {
+                body.append("Affected API endpoints (detected):\n```\n(none)\n```\n\n");
             }
 
             body.append("Test summary:\n```\n").append(summary).append("\n```\n\n");
@@ -132,7 +147,7 @@ public class PrChangeTestAnalyzer {
             postPrComment(repo, prNum, tmp);
 
             if (intendedExit != 0) System.exit(intendedExit);
-            System.out.println("Posted PR analysis and test results.");
+            System.out.println("Posted PR analysis, endpoints, and test results.");
         } catch (Exception e) {
             System.err.println("Failed to run PR analyzer: " + e);
             System.exit(0);
@@ -154,6 +169,16 @@ public class PrChangeTestAnalyzer {
         static TestResult noTests(String msg){ return new TestResult(false,0,"(no tests executed)",msg,"(none)"); }
         static TestResult noProject(String msg){ return new TestResult(false,0,"(no project detected)",msg,"(none)"); }
     }
+    static class Endpoint {
+        final String httpMethod; final String path; final String controllerSimple; final String methodName; final String reason;
+        Endpoint(String m, String p, String ctrl, String meth, String r){ httpMethod=m; path=p; controllerSimple=ctrl; methodName=meth; reason=r; }
+        @Override public int hashCode(){ return Objects.hash(httpMethod, path, controllerSimple, methodName); }
+        @Override public boolean equals(Object o){
+            if (!(o instanceof Endpoint e)) return false;
+            return Objects.equals(httpMethod,e.httpMethod) && Objects.equals(path,e.path) &&
+                    Objects.equals(controllerSimple,e.controllerSimple) && Objects.equals(methodName,e.methodName);
+        }
+    }
 
     // ========= Step 1: changed files =========
     private static List<ChangedFile> listChangedFiles(String repo, String prNum) throws IOException, InterruptedException {
@@ -171,7 +196,7 @@ public class PrChangeTestAnalyzer {
         return out;
     }
 
-    // ========= Step 2: enhanced Spring Boot mapping =========
+    // ========= Step 2: enhanced Spring Boot mapping for tests =========
     private static ProjectType detectProjectType() {
         if (Files.exists(Path.of("pom.xml"))) return ProjectType.MAVEN;
         if (Files.exists(Path.of("gradlew"))) return ProjectType.GRADLE;
@@ -187,14 +212,14 @@ public class PrChangeTestAnalyzer {
         for (ChangedFile cf : changed) {
             if (!cf.filename.endsWith(".java")) continue;
 
-            // 2.1 If test file changed, include it directly
+            // Include changed test files directly
             if (cf.filename.startsWith("src/test/java/")) {
-                listingPaths.add(cf.filename);
+                listingPaths.add(cf.filename.replace('\\','/'));
                 addSimpleNameFromTestPath(simpleNames, cf.filename);
                 continue;
             }
 
-            // 2.2 If main code changed, build FQN and mapping
+            // Map main code changes to tests
             if (cf.filename.startsWith("src/main/java/")) {
                 String rel = cf.filename.substring("src/main/java/".length());
                 if (!rel.endsWith(".java")) continue;
@@ -203,7 +228,7 @@ public class PrChangeTestAnalyzer {
                 String pkgDir = relNoExt.contains("/") ? relNoExt.substring(0, relNoExt.lastIndexOf('/')) : "";
                 String fqn = relNoExt.replace('/', '.');
 
-                // A) Heuristic test names
+                // Heuristic name mapping
                 List<String> heuristics = List.of(
                         "src/test/java/" + pkgDir + "/" + leaf + "Test.java",
                         "src/test/java/" + pkgDir + "/" + "Test" + leaf + ".java",
@@ -216,11 +241,11 @@ public class PrChangeTestAnalyzer {
                     }
                 }
 
-                // B) Same-package tests (include subpackages) for Spring slices/integration
+                // Same-package tests
                 addAllTestsUnderPackage(listingPaths, simpleNames, pkgDir);
 
-                // C) Reference scanning in test sources (import/FQN.class/new/@WebMvcTest/@MockBean/@Autowired)
-                addRefScannedTests(listingPaths, simpleNames, fqn, leaf);
+                // Reference scanning in tests
+                addRefScannedTestsInTests(listingPaths, simpleNames, fqn, leaf);
             }
         }
 
@@ -229,14 +254,11 @@ public class PrChangeTestAnalyzer {
     }
 
     private static void addSimpleNameFromTestPath(Set<String> simpleNames, String testPath) {
-        String leaf = testPath.substring(testPath.lastIndexOf('/') + 1);
-        if (leaf.endsWith(".java")) {
-            simpleNames.add(leaf.substring(0, leaf.length() - 5));
-        }
+        String leaf = testPath.substring(testPath.lastIndexOf('/') + 1).replace('\\','/');
+        if (leaf.endsWith(".java")) simpleNames.add(leaf.substring(0, leaf.length() - 5));
     }
 
     private static void addAllTestsUnderPackage(Set<String> listingPaths, Set<String> simpleNames, String pkgDir) throws IOException {
-        // src/test/java/<pkgDir>/**  where filename matches *Test.java or *Tests.java
         Path root = Path.of("src", "test", "java").resolve(pkgDir);
         if (!Files.exists(root)) return;
         try (var walk = Files.walk(root)) {
@@ -250,13 +272,7 @@ public class PrChangeTestAnalyzer {
         }
     }
 
-    private static void addRefScannedTests(Set<String> listingPaths, Set<String> simpleNames, String fqn, String leaf) throws IOException, InterruptedException {
-        // Build grep patterns
-        // - import <fqn>
-        // - <fqn>.class
-        // - @WebMvcTest(<leaf>.class) / @MockBean(<leaf>.class)
-        // - @Autowired <leaf>
-        // - new <leaf>(
+    private static void addRefScannedTestsInTests(Set<String> listingPaths, Set<String> simpleNames, String fqn, String leaf) throws IOException, InterruptedException {
         String pattern = String.join("|", List.of(
                 Pattern.quote("import " + fqn),
                 Pattern.quote(fqn + ".class"),
@@ -265,18 +281,12 @@ public class PrChangeTestAnalyzer {
                 "@Autowired\\s+[^;\\n]*\\b" + Pattern.quote(leaf) + "\\b",
                 "\\bnew\\s+" + Pattern.quote(leaf) + "\\s*\\("
         ));
-
-        String cmd = "bash -lc " + shellQuote(
-                "set -o pipefail; " +
-                        "if command -v grep >/dev/null 2>&1; then " +
-                        "grep -RIl --include='*.java' -E '" + pattern + "' src/test/java || true; " +
-                        "fi"
-        );
-        String out = runProcess(new String[]{"bash", "-lc", cmd});
+        String out = runProcess(new String[]{"bash", "-lc",
+                "set -o pipefail; if command -v grep >/dev/null 2>&1; then " +
+                        "grep -RIl --include='*.java' -E '" + pattern + "' src/test/java || true; fi"});
         for (String line : out.split("\\R")) {
-            String p = line.trim();
-            if (p.isEmpty()) continue;
-            String norm = p.replace('\\', '/');
+            String p = line.trim(); if (p.isEmpty()) continue;
+            String norm = p.replace('\\','/');
             if (norm.endsWith(".java")) {
                 listingPaths.add(norm);
                 addSimpleNameFromTestPath(simpleNames, norm);
@@ -284,10 +294,218 @@ public class PrChangeTestAnalyzer {
         }
     }
 
-    // ========= Step 3: run tests =========
+    // ========= Step 3: affected API endpoints detection =========
+    private static List<Endpoint> detectAffectedEndpoints(List<ChangedFile> changed) throws IOException, InterruptedException {
+        LinkedHashSet<Endpoint> set = new LinkedHashSet<>();
+
+        // 1) Controllers directly modified
+        for (ChangedFile cf : changed) {
+            if (cf.filename.startsWith("src/main/java/") && cf.filename.endsWith(".java")) {
+                Path p = Path.of(cf.filename);
+                if (Files.exists(p)) {
+                    String content = Files.readString(p, StandardCharsets.UTF_8);
+                    if (isControllerFile(p, content)) {
+                        String controllerSimple = simpleClassNameFromContent(content, p);
+                        List<Endpoint> eps = parseControllerEndpoints(p, content, "controller modified: " + cf.filename, controllerSimple);
+                        set.addAll(eps);
+                    }
+                }
+            }
+        }
+
+        // 2) For non-controller changed classes, find referencing controllers
+        List<ChangedMainClass> changedClasses = new ArrayList<>();
+        for (ChangedFile cf : changed) {
+            if (cf.filename.startsWith("src/main/java/") && cf.filename.endsWith(".java")) {
+                String rel = cf.filename.substring("src/main/java/".length());
+                String relNoExt = rel.substring(0, rel.length() - 5);
+                String fqn = relNoExt.replace('/', '.').replace('\\','.');
+                String leaf = relNoExt.contains("/") ? relNoExt.substring(relNoExt.lastIndexOf('/') + 1) : relNoExt;
+                changedClasses.add(new ChangedMainClass(fqn, leaf, cf.filename));
+            }
+        }
+        if (!changedClasses.isEmpty()) {
+            List<Path> controllers = listAllControllerFiles();
+            for (Path ctrl : controllers) {
+                String content = Files.readString(ctrl, StandardCharsets.UTF_8);
+                String reasonRef = null;
+                for (ChangedMainClass c : changedClasses) {
+                    if (referencesClass(content, c)) {
+                        reasonRef = "references changed class " + c.fqn;
+                        break;
+                    }
+                }
+                if (reasonRef != null) {
+                    String controllerSimple = simpleClassNameFromContent(content, ctrl);
+                    List<Endpoint> eps = parseControllerEndpoints(ctrl, content, reasonRef, controllerSimple);
+                    set.addAll(eps);
+                }
+            }
+        }
+
+        return new ArrayList<>(set);
+    }
+
+    private record ChangedMainClass(String fqn, String leaf, String file) {}
+
+    private static boolean referencesClass(String content, ChangedMainClass c) {
+        String pattern = String.join("|", List.of(
+                "\\bimport\\s+" + Pattern.quote(c.fqn) + "\\s*;",
+                Pattern.quote(c.fqn) + "\\s*\\.\\s*class\\b",
+                "\\bnew\\s+" + Pattern.quote(c.leaf) + "\\s*\\(",
+                "@Autowired\\s+[^;\\n]*\\b" + Pattern.quote(c.leaf) + "\\b"
+        ));
+        return Pattern.compile(pattern, Pattern.DOTALL).matcher(content).find();
+    }
+
+    private static List<Path> listAllControllerFiles() throws IOException {
+        List<Path> list = new ArrayList<>();
+        Path root = Path.of("src", "main", "java");
+        if (!Files.exists(root)) return list;
+        try (var walk = Files.walk(root)) {
+            for (Path p : walk.filter(Files::isRegularFile).filter(pp -> pp.toString().endsWith(".java")).toList()) {
+                try {
+                    String s = Files.readString(p, StandardCharsets.UTF_8);
+                    if (isControllerFile(p, s)) list.add(p);
+                } catch (Exception ignored) {}
+            }
+        }
+        return list;
+    }
+
+    private static boolean isControllerFile(Path p, String content) {
+        String norm = p.toString().replace('\\','/').toLowerCase(Locale.ROOT);
+        if (norm.contains("/controller/")) return true;
+        return content.contains("@RestController") || content.contains("@Controller");
+    }
+
+    private static String simpleClassNameFromContent(String content, Path p) {
+        Matcher m = Pattern.compile("\\bclass\\s+(\\w+)\\b").matcher(content);
+        if (m.find()) return m.group(1);
+        String file = p.getFileName().toString();
+        return file.endsWith(".java") ? file.substring(0, file.length()-5) : file;
+    }
+
+    private static List<Endpoint> parseControllerEndpoints(Path ctrlFile, String content, String reason, String controllerSimple) {
+        int classPos = indexOfClassDecl(content);
+        String header = classPos > 0 ? content.substring(0, classPos) : content;
+        String body = classPos > 0 ? content.substring(classPos) : content;
+
+        List<String> classBases = extractRequestMappingPaths(header);
+        if (classBases.isEmpty()) classBases = List.of("");
+
+        List<Endpoint> out = new ArrayList<>();
+
+        Matcher ann = Pattern.compile("@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\\s*(\\(([^)]*)\\))?", Pattern.MULTILINE).matcher(body);
+        while (ann.find()) {
+            String type = ann.group(1);
+            String params = ann.group(3) == null ? "" : ann.group(3);
+
+            List<String> methodPaths = extractPathsFromParams(params);
+            if (methodPaths.isEmpty()) methodPaths = List.of("");
+
+            List<String> httpMethods = new ArrayList<>();
+            if (!"RequestMapping".equals(type)) {
+                httpMethods = List.of(type.replace("Mapping","").toUpperCase(Locale.ROOT));
+            } else {
+                httpMethods = extractRequestMethods(params);
+                if (httpMethods.isEmpty()) httpMethods = List.of("ANY");
+            }
+
+            String methodName = findFollowingMethodName(body, ann.end());
+            for (String base : classBases) {
+                for (String mp : methodPaths) {
+                    String full = normalizePath(base, mp);
+                    for (String hm : httpMethods) {
+                        out.add(new Endpoint(hm, full, controllerSimple, methodName, reason));
+                    }
+                }
+            }
+        }
+
+        if (out.isEmpty() && !classBases.equals(List.of(""))) {
+            for (String base : classBases) {
+                out.add(new Endpoint("ANY", normalizePath(base, ""), controllerSimple, "", reason));
+            }
+        }
+        return out;
+    }
+
+    private static int indexOfClassDecl(String content) {
+        Matcher m = Pattern.compile("\\bclass\\s+\\w+\\b").matcher(content);
+        return m.find() ? m.start() : -1;
+    }
+
+    private static List<String> extractRequestMappingPaths(String text) {
+        List<String> paths = new ArrayList<>();
+        Matcher m = Pattern.compile("@RequestMapping\\s*\\(([^)]*)\\)").matcher(text);
+        while (m.find()) {
+            String params = m.group(1);
+            paths.addAll(extractPathsFromParams(params));
+            if (paths.isEmpty()) paths.addAll(extractStringLiterals(params));
+        }
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        for (String p : paths) out.add(normalizePath(p, ""));
+        return new ArrayList<>(out);
+    }
+
+    private static List<String> extractPathsFromParams(String params) {
+        List<String> paths = new ArrayList<>();
+        if (params == null) return paths;
+        Matcher named = Pattern.compile("\\b(value|path)\\s*=\\s*(\\{[^}]*\\}|\"[^\"]*\"|'[^']*')").matcher(params);
+        while (named.find()) {
+            String val = named.group(2);
+            paths.addAll(extractStringLiterals(val));
+        }
+        if (paths.isEmpty()) paths.addAll(extractStringLiterals(params));
+        return paths;
+    }
+
+    private static List<String> extractRequestMethods(String params) {
+        List<String> methods = new ArrayList<>();
+        if (params == null) return methods;
+        Matcher mm = Pattern.compile("\\bmethod\\s*=\\s*(\\{[^}]*\\}|[^,\\)]+)").matcher(params);
+        if (mm.find()) {
+            String group = mm.group(1);
+            Matcher each = Pattern.compile("RequestMethod\\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)", Pattern.CASE_INSENSITIVE).matcher(group);
+            while (each.find()) methods.add(each.group(1).toUpperCase(Locale.ROOT));
+        }
+        return methods;
+    }
+
+    private static List<String> extractStringLiterals(String text) {
+        List<String> out = new ArrayList<>();
+        if (text == null) return out;
+        Matcher m = Pattern.compile("\"([^\"]*)\"|'([^']*)'").matcher(text);
+        while (m.find()) {
+            String s = m.group(1) != null ? m.group(1) : m.group(2);
+            if (s != null) out.add(s);
+        }
+        return out;
+    }
+
+    private static String findFollowingMethodName(String body, int startIdx) {
+        String tail = body.substring(startIdx);
+        Matcher m = Pattern.compile("(public|protected|private)\\s+(static\\s+)?[\\w<>,\\[\\]\\s]+\\s+(\\w+)\\s*\\(", Pattern.MULTILINE).matcher(tail);
+        if (m.find()) return m.group(3);
+        m = Pattern.compile("\\b(\\w+)\\s*\\(").matcher(tail);
+        return m.find() ? m.group(1) : "";
+    }
+
+    private static String normalizePath(String base, String methodPath) {
+        String a = (base == null ? "" : base.trim());
+        String b = (methodPath == null ? "" : methodPath.trim());
+        String s = (a + "/" + b).replaceAll("/{2,}", "/");
+        if (!s.startsWith("/")) s = "/" + s;
+        if (s.length() > 1 && s.endsWith("/")) s = s.substring(0, s.length()-1);
+        return s;
+    }
+
+    // ========= Step 3b: run tests =========
     private static TestResult runMavenTests(List<String> simpleClassNames) throws IOException, InterruptedException {
         if (simpleClassNames.isEmpty()) return TestResult.noTests("No Maven tests selected.");
         String testProp = String.join(",", simpleClassNames);
+        // Include deactivation of JUnit @Disabled via conditions
         String cmd = "mvn -B -DskipITs=true -DfailIfNoTests=false -Dtest=" + shellQuote(testProp) + "  -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition test";
         ExecResult er = execute(new String[]{"bash", "-lc", cmd});
         return new TestResult(true, er.exitCode, cmd, er.stdout, "maven");
@@ -591,7 +809,12 @@ public class PrChangeTestAnalyzer {
         int colon = json.indexOf(':', i + key.length()); if (colon < 0) return "";
         int startQuote = json.indexOf('"', colon + 1); if (startQuote < 0) return "";
         int end = startQuote + 1; boolean escape = false;
-        while (end < json.length()) { char c = json.charAt(end); if (c == '"' && !escape) break; escape = (c == '\\') && !escape; end++; }
+        while (end < json.length()) {
+            char c = json.charAt(end);
+            if (c == '"' && !escape) break;
+            escape = (c == '\\') && !escape;
+            end++;
+        }
         if (end >= json.length()) return ""; String val = json.substring(startQuote + 1, end);
         return val.replace("\\n", "\n").replace("\\\"", "\"");
     }
