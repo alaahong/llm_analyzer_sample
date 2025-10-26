@@ -1,5 +1,5 @@
 /* Java 21 PR Targeted Test Analyzer with OpenRouter suggestions and rule-based fallback.
- * Spring Boot enhanced mapping + affected API endpoints:
+ * Spring Boot enhanced mapping + affected API endpoints + optional LLM-assisted test selection:
  *  - From changed src/main/java FQN -> find tests and affected controllers by:
  *      * Heuristic name mapping: FooTest/TestFoo/FooTests
  *      * Same-package test discovery under src/test/java/<pkgDir>/**
@@ -14,9 +14,13 @@
  *  - Maven test command disables JUnit @Disabled via:
  *      -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition
  *
- * Optional local/self-hosted LLM:
+ * Optional local/self-hosted LLM (OpenAI-compatible):
  *  - LLM_PROVIDER=openai to call any OpenAI-compatible /v1/chat/completions endpoint (e.g., Ollama/vLLM/LM Studio/llama.cpp).
  *  - LLM_BASE_URL, LLM_MODEL, LLM_API_KEY control the local provider call.
+ *
+ * Optional LLM-assisted test selection (two-stage scheme):
+ *  - LLM_TEST_SELECTOR=true to enable LLMAssistedSelector which refines and expands the heuristic test set.
+ *  - Requires the companion class scripts/LLMAssistedSelector.java present in the same (default) package.
  */
 import java.io.*;
 import java.net.URI;
@@ -64,6 +68,40 @@ public class PrChangeTestAnalyzer {
             // 2) Project type and Spring Boot enhanced mapping for tests
             ProjectType projectType = detectProjectType();
             TestPlan testPlan = buildSpringBootEnhancedTestPlan(changed, projectType);
+
+            // 2b) Optional LLM-assisted test selection (refine/expand the heuristic list)
+            String llmSelectorRationale = "";
+            if (isClassPresent("LLMAssistedSelector") && LLMAssistedSelector.isEnabled() && !testPlan.testClasses.isEmpty()) {
+                // Prepare selector inputs
+                List<String> changedFilesForSelector = changed.stream()
+                        .map(cf -> cf.status + " " + cf.filename)
+                        .collect(Collectors.toList());
+                Map<String, List<String>> pkgIndex = new LinkedHashMap<>();
+                if (testPlan.candidateTestsListing != null && !testPlan.candidateTestsListing.isBlank()) {
+                    for (String line : testPlan.candidateTestsListing.split("\\R")) {
+                        if (line == null || line.isBlank()) continue;
+                        String norm = line.replace('\\', '/');
+                        String rel = norm.replaceFirst("^src/test/java/", "");
+                        int slash = rel.lastIndexOf('/');
+                        String pkg = slash > 0 ? rel.substring(0, slash).replace('/', '.') : "(default)";
+                        String cls = rel.substring(rel.lastIndexOf('/') + 1).replaceAll("\\.java$", "");
+                        pkgIndex.computeIfAbsent(pkg, k -> new ArrayList<>()).add(cls);
+                    }
+                }
+                Map<String, String> fileToDiff = new LinkedHashMap<>();
+                for (ChangedFile cf : changed) {
+                    String safe = shellQuote(cf.filename);
+                    String diff = runProcess(new String[]{"bash", "-lc", "git --no-pager diff --unified=0 -- " + safe + " | sed -n '1,200p' || true"});
+                    fileToDiff.put(cf.filename, diff == null ? "" : diff);
+                    if (fileToDiff.size() >= 80) break;
+                }
+                LLMAssistedSelector.Selection sel = LLMAssistedSelector.refine(
+                        testPlan.testClasses, changedFilesForSelector, pkgIndex, fileToDiff);
+                if (sel != null && sel.refinedClasses != null && !sel.refinedClasses.isEmpty()) {
+                    testPlan = new TestPlan(projectType, sel.refinedClasses, testPlan.candidateTestsListing);
+                }
+                llmSelectorRationale = (sel != null ? sel.rationale : "");
+            }
 
             // 3) Affected API endpoints (Spring MVC)
             List<Endpoint> endpoints = detectAffectedEndpoints(changed);
@@ -119,19 +157,25 @@ public class PrChangeTestAnalyzer {
             // 7) Compose PR comment
             String prUrl = serverUrl + "/" + repo + "/pull/" + prNum;
             StringBuilder body = new StringBuilder();
-            body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced + API endpoints)\n\n");
+            body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced + API endpoints");
+            if (LLMAssistedSelector.isEnabled()) body.append(" + LLM-assisted selection");
+            body.append(")\n\n");
             body.append("- PR: ").append(prUrl).append("\n");
             body.append("- Build tool: ").append(projectType).append("\n");
-            body.append("- Selected tests (enhanced mapping): ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
+            body.append("- Selected tests: ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
             body.append("- Test command: ").append(testResult.command).append("\n");
             body.append("- Test exit code: ").append(testResult.executed ? testResult.exitCode : "(n/a)").append("\n");
-            if (failOnTestFailure) body.append("- Fail-on-test-failure: enabled\n");
-            body.append("\n");
+            body.append("- Fail-on-test-failure: ").append(failOnTestFailure ? "enabled" : "disabled").append("\n\n");
 
             body.append("Changed files:\n```\n").append(changedFilesBlock).append("\n```\n\n");
-            if (!testPlan.candidateTestsListing.isBlank()) {
+            if (!isBlank(testPlan.candidateTestsListing)) {
                 body.append("Candidate test files (mapped and existing, de-duplicated):\n```\n")
                         .append(testPlan.candidateTestsListing).append("\n```\n\n");
+            }
+
+            if (LLMAssistedSelector.isEnabled() && !isBlank(llmSelectorRationale)) {
+                body.append("LLM-selected tests rationale:\n```\n")
+                        .append(trimTo(llmSelectorRationale, 4000)).append("\n```\n\n");
             }
 
             if (!endpoints.isEmpty()) {
@@ -154,8 +198,8 @@ public class PrChangeTestAnalyzer {
                         .append(failureDiagnostics).append("\n```\n\n");
             }
 
-            // Task Analysis section: render raw markdown (no code fence)
-            body.append("Task Analysis:\n").append(llmAnalysis).append("\n");
+            body.append("Analysis and suggestions:\n")
+                    .append(llmAnalysis).append("\n");
 
             String finalBody = body.toString();
             if (finalBody.length() > BODY_MAX_CHARS) {
@@ -670,7 +714,7 @@ public class PrChangeTestAnalyzer {
             if (status >= 200 && status < 300) {
                 String content = extractJsonField(resp.body(), "content");
                 if (isBlank(content)) content = resp.body();
-                return content.trim(); // return raw markdown (no code fence)
+                return "```\n" + content.trim() + "\n```";
             } else if (status == 401 || status == 403) {
                 return "OpenRouter " + status + " (key invalid or insufficient scope). Falling back to rule-based suggestions.\n\n" + ruleBasedSuggestions(prompt);
             } else if (status == 404) {
@@ -723,7 +767,7 @@ public class PrChangeTestAnalyzer {
             if (status >= 200 && status < 300) {
                 String content = extractJsonField(resp.body(), "content");
                 if (isBlank(content)) content = resp.body();
-                return content.trim(); // return raw markdown (no code fence)
+                return "```\n" + content.trim() + "\n```";
             } else if (status == 401 || status == 403) {
                 return "OpenAI-compatible " + status + " (invalid key or not provided). Falling back to rule-based suggestions.\n\n" + ruleBasedSuggestions(fallbackContext);
             } else if (status == 404) {
@@ -787,7 +831,7 @@ public class PrChangeTestAnalyzer {
         if (sb.toString().equals("Fallback suggestions (rule-based):\n")) {
             sb.append("- No specific signature detected. Re-run selected tests with verbose logs and inspect diffs for edge cases.\n");
         }
-        return sb.toString().trim(); // return raw markdown (no code fence)
+        return "```\n" + sb.toString().trim() + "\n```";
     }
 
     // ========= PR comment & helpers =========
@@ -912,4 +956,15 @@ public class PrChangeTestAnalyzer {
     }
     private static int parseIntSafe(String s, int def) { try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; } }
     private static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); }
+
+    // Small helper to detect if LLMAssistedSelector class is available at runtime (optional feature)
+    private static boolean isClassPresent(String simpleName) {
+        try {
+            // default package: just try to load by simple name
+            Class.forName(simpleName);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 }
