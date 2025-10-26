@@ -4,6 +4,7 @@
  *      * Heuristic name mapping: FooTest/TestFoo/FooTests
  *      * Same-package test discovery under src/test/java/<pkgDir>/**
  *      * Reference scanning in tests and controllers
+ *      * Impact scan: find main classes that reference changed classes, and include their tests (e.g., model change -> service tests)
  *  - Parse Spring MVC annotations to build endpoints (class + method level).
  *  - De-duplicate candidate test files and endpoints; only show focused failure diagnostics on failures.
  *
@@ -72,7 +73,7 @@ public class PrChangeTestAnalyzer {
             // 2b) Optional LLM-assisted test selection via reflection (no compile-time dependency)
             boolean llmSelectorApplied = false;
             String llmSelectorRationale = "";
-            if (isTruth(getenvOr("LLM_TEST_SELECTOR", "TRUE")) && !testPlan.testClasses.isEmpty()) {
+            if (isTruth(getenvOr("LLM_TEST_SELECTOR", "false")) && !testPlan.testClasses.isEmpty()) {
                 try {
                     // Check class presence and isEnabled flag
                     Class<?> selClass = Class.forName("LLMAssistedSelector");
@@ -112,7 +113,6 @@ public class PrChangeTestAnalyzer {
 
                         if (selObj != null) {
                             // Read fields from LLMAssistedSelector.Selection via reflection
-                            // Try public fields refinedClasses and rationale (per provided class)
                             List<String> refined = null;
                             String rationale = "";
                             try {
@@ -284,6 +284,9 @@ public class PrChangeTestAnalyzer {
         }
     }
 
+    // For impact scan (main-code reverse references)
+    private record MainClassRef(Path path, String fqn, String leaf, String pkgDir) {}
+
     // ========= Step 1: changed files =========
     private static List<ChangedFile> listChangedFiles(String repo, String prNum) throws IOException, InterruptedException {
         List<ChangedFile> out = new ArrayList<>();
@@ -348,10 +351,18 @@ public class PrChangeTestAnalyzer {
                 // Same-package tests
                 addAllTestsUnderPackage(listingPaths, simpleNames, pkgDir);
 
-                // Reference scanning in tests
+                // Reference scanning in tests for this changed class
                 addRefScannedTestsInTests(listingPaths, simpleNames, fqn, leaf);
             }
         }
+
+        // Impact scan: find main classes that reference changed main classes, and include their tests
+        try {
+            Set<MainClassRef> impacted = findImpactedMainClasses(changed);
+            if (!impacted.isEmpty()) {
+                addTestsForImpactedMainClasses(impacted, listingPaths, simpleNames);
+            }
+        } catch (Exception ignored) {}
 
         String listing = listingPaths.stream().collect(Collectors.joining("\n"));
         return new TestPlan(ProjectType.MAVEN, new ArrayList<>(simpleNames), listing);
@@ -394,6 +405,108 @@ public class PrChangeTestAnalyzer {
             if (norm.endsWith(".java")) {
                 listingPaths.add(norm);
                 addSimpleNameFromTestPath(simpleNames, norm);
+            }
+        }
+    }
+
+    // Impact scan: find main classes referencing changed main classes
+    private static Set<MainClassRef> findImpactedMainClasses(List<ChangedFile> changed) throws IOException {
+        // Collect changed main classes (fqn/leaf)
+        List<MainClassRef> changedMain = new ArrayList<>();
+        for (ChangedFile cf : changed) {
+            if (cf.filename.startsWith("src/main/java/") && cf.filename.endsWith(".java")) {
+                String rel = cf.filename.substring("src/main/java/".length());
+                String relNoExt = rel.substring(0, rel.length() - 5);
+                String leaf = relNoExt.contains("/") ? relNoExt.substring(relNoExt.lastIndexOf('/') + 1) : relNoExt;
+                String pkgDir = relNoExt.contains("/") ? relNoExt.substring(0, relNoExt.lastIndexOf('/')) : "";
+                String fqn = relNoExt.replace('/', '.');
+                changedMain.add(new MainClassRef(Path.of(cf.filename), fqn, leaf, pkgDir));
+            }
+        }
+        if (changedMain.isEmpty()) return Set.of();
+
+        Path root = Path.of("src", "main", "java");
+        if (!Files.exists(root)) return Set.of();
+
+        Set<MainClassRef> impacted = new LinkedHashSet<>();
+        try (var walk = Files.walk(root)) {
+            for (Path p : walk.filter(Files::isRegularFile).filter(x -> x.toString().endsWith(".java")).toList()) {
+                String content;
+                try { content = Files.readString(p, StandardCharsets.UTF_8); } catch (Exception e) { continue; }
+
+                // Skip self
+                boolean isChanged = false;
+                for (MainClassRef c : changedMain) if (p.equals(c.path)) { isChanged = true; break; }
+                if (isChanged) continue;
+
+                // Does this file reference any changed class?
+                boolean ref = false;
+                for (MainClassRef c : changedMain) {
+                    String pat = String.join("|", List.of(
+                            "\\bimport\\s+" + Pattern.quote(c.fqn) + "\\s*;",
+                            Pattern.quote(c.fqn) + "\\s*\\.\\s*class\\b",
+                            "\\bnew\\s+" + Pattern.quote(c.leaf) + "\\s*\\(",
+                            "@Autowired\\s+[^;\\n]*\\b" + Pattern.quote(c.leaf) + "\\b",
+                            // field/param type occurrences (best-effort)
+                            "\\b" + Pattern.quote(c.leaf) + "\\b\\s+[a-zA-Z_][a-zA-Z0-9_]*\\s*(=|;|\\))",
+                            "\\b\\w+\\s+\\b" + Pattern.quote(c.leaf) + "\\b\\s*(,|\\)|\\.)"
+                    ));
+                    if (Pattern.compile(pat, Pattern.DOTALL).matcher(content).find()) {
+                        ref = true; break;
+                    }
+                }
+                if (!ref) continue;
+
+                String rel = root.relativize(p).toString().replace('\\','/');
+                String relNoExt = rel.substring(0, rel.length() - 5);
+                String leaf = relNoExt.contains("/") ? relNoExt.substring(relNoExt.lastIndexOf('/') + 1) : relNoExt;
+                String pkgDir = relNoExt.contains("/") ? relNoExt.substring(0, relNoExt.lastIndexOf('/')) : "";
+                String fqn = relNoExt.replace('/', '.');
+                impacted.add(new MainClassRef(p, fqn, leaf, pkgDir));
+            }
+        }
+        // Cap to avoid explosion
+        if (impacted.size() > 200) {
+            return impacted.stream().limit(200).collect(Collectors.toCollection(LinkedHashSet::new));
+        }
+        return impacted;
+    }
+
+    private static void addTestsForImpactedMainClasses(Set<MainClassRef> impacted,
+                                                       Set<String> listingPaths,
+                                                       Set<String> simpleNames) throws IOException, InterruptedException {
+        for (MainClassRef mc : impacted) {
+            // Heuristic tests in same package
+            List<String> candidates = List.of(
+                    "src/test/java/" + mc.pkgDir + "/" + mc.leaf + "Test.java",
+                    "src/test/java/" + mc.pkgDir + "/Test" + mc.leaf + ".java",
+                    "src/test/java/" + mc.pkgDir + "/" + mc.leaf + "Tests.java"
+            );
+            for (String c : candidates) {
+                if (Files.exists(Path.of(c))) {
+                    listingPaths.add(c);
+                    addSimpleNameFromTestPath(simpleNames, c);
+                }
+            }
+            // Tests referencing the impacted main class
+            String pattern = String.join("|", List.of(
+                    Pattern.quote("import " + mc.fqn),
+                    Pattern.quote(mc.fqn + ".class"),
+                    "@WebMvcTest\\s*\\(.*\\b" + Pattern.quote(mc.leaf) + "\\s*\\.\\s*class\\b.*\\)",
+                    "@MockBean\\s*\\(.*\\b" + Pattern.quote(mc.leaf) + "\\s*\\.\\s*class\\b.*\\)",
+                    "@Autowired\\s+[^;\\n]*\\b" + Pattern.quote(mc.leaf) + "\\b",
+                    "\\bnew\\s+" + Pattern.quote(mc.leaf) + "\\s*\\("
+            ));
+            String out = runProcess(new String[]{"bash","-lc",
+                    "set -o pipefail; if command -v grep >/dev/null 2>&1; then " +
+                            "grep -RIl --include='*.java' -E '" + pattern + "' src/test/java || true; fi"});
+            for (String line : out.split("\\R")) {
+                String p = line.trim(); if (p.isEmpty()) continue;
+                String norm = p.replace('\\','/');
+                if (norm.endsWith(".java")) {
+                    listingPaths.add(norm);
+                    addSimpleNameFromTestPath(simpleNames, norm);
+                }
             }
         }
     }
