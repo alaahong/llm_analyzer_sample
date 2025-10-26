@@ -1,4 +1,4 @@
-name: PR Targeted Test Analyzer (OpenRouter)
+name: PR Targeted Test Analyzer
 
 on:
   pull_request:
@@ -42,12 +42,25 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           SERVER_URL: ${{ github.server_url }}
           API_URL: ${{ github.api_url }}
-          WORKFLOW_NAME: PR Targeted Test Analyzer (OpenRouter)
-          # OpenRouter (preferred provider)
+          WORKFLOW_NAME: PR Targeted Test Analyzer
+          # OpenRouter (optional, for AI suggestions)
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'meta-llama/llama-3.3-8b-instruct:free' }}
-          # Limits
+          # Limits and behavior
           ANALYZER_MAX_HIGHLIGHTS: ${{ vars.ANALYZER_MAX_HIGHLIGHTS || '200' }}
           LLM_MAX_TOKENS: ${{ vars.LLM_MAX_TOKENS || '800' }}
+          # Fail the job when targeted tests fail (default false)
+          FAIL_ON_TEST_FAILURE: ${{ vars.FAIL_ON_TEST_FAILURE || 'false' }}
         run: |
           java scripts/PrChangeTestAnalyzer.java
+
+      - name: Upload surefire/gradle test reports (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-targeted-test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+            **/build/test-results/test/**
+          if-no-files-found: ignore
