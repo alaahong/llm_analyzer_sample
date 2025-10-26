@@ -1,5 +1,5 @@
 /* Java 21 PR Targeted Test Analyzer with OpenRouter suggestions and rule-based fallback.
- * Spring Boot enhanced mapping + affected API endpoints + optional LLM-assisted test selection:
+ * Spring Boot enhanced mapping + affected API endpoints + optional LLM-assisted test selection (via reflection):
  *  - From changed src/main/java FQN -> find tests and affected controllers by:
  *      * Heuristic name mapping: FooTest/TestFoo/FooTests
  *      * Same-package test discovery under src/test/java/<pkgDir>/**
@@ -19,8 +19,8 @@
  *  - LLM_BASE_URL, LLM_MODEL, LLM_API_KEY control the local provider call.
  *
  * Optional LLM-assisted test selection (two-stage scheme):
- *  - LLM_TEST_SELECTOR=true to enable LLMAssistedSelector which refines and expands the heuristic test set.
- *  - Requires the companion class scripts/LLMAssistedSelector.java present in the same (default) package.
+ *  - LLM_TEST_SELECTOR=true to enable LLMAssistedSelector (if present) via reflection.
+ *  - If scripts/LLMAssistedSelector.java is not present/compiled, selection is skipped silently.
  */
 import java.io.*;
 import java.net.URI;
@@ -69,38 +69,71 @@ public class PrChangeTestAnalyzer {
             ProjectType projectType = detectProjectType();
             TestPlan testPlan = buildSpringBootEnhancedTestPlan(changed, projectType);
 
-            // 2b) Optional LLM-assisted test selection (refine/expand the heuristic list)
+            // 2b) Optional LLM-assisted test selection via reflection (no compile-time dependency)
+            boolean llmSelectorApplied = false;
             String llmSelectorRationale = "";
-            if (isClassPresent("LLMAssistedSelector") && LLMAssistedSelector.isEnabled() && !testPlan.testClasses.isEmpty()) {
-                // Prepare selector inputs
-                List<String> changedFilesForSelector = changed.stream()
-                        .map(cf -> cf.status + " " + cf.filename)
-                        .collect(Collectors.toList());
-                Map<String, List<String>> pkgIndex = new LinkedHashMap<>();
-                if (testPlan.candidateTestsListing != null && !testPlan.candidateTestsListing.isBlank()) {
-                    for (String line : testPlan.candidateTestsListing.split("\\R")) {
-                        if (line == null || line.isBlank()) continue;
-                        String norm = line.replace('\\', '/');
-                        String rel = norm.replaceFirst("^src/test/java/", "");
-                        int slash = rel.lastIndexOf('/');
-                        String pkg = slash > 0 ? rel.substring(0, slash).replace('/', '.') : "(default)";
-                        String cls = rel.substring(rel.lastIndexOf('/') + 1).replaceAll("\\.java$", "");
-                        pkgIndex.computeIfAbsent(pkg, k -> new ArrayList<>()).add(cls);
+            if (isTruth(getenvOr("LLM_TEST_SELECTOR", "TRUE")) && !testPlan.testClasses.isEmpty()) {
+                try {
+                    // Check class presence and isEnabled flag
+                    Class<?> selClass = Class.forName("LLMAssistedSelector");
+                    boolean enabled = false;
+                    try {
+                        enabled = (Boolean) selClass.getMethod("isEnabled").invoke(null);
+                    } catch (Throwable ignored) {}
+                    if (enabled) {
+                        // Build selector inputs
+                        List<String> changedFilesForSelector = changed.stream()
+                                .map(cf -> cf.status + " " + cf.filename)
+                                .collect(Collectors.toList());
+                        Map<String, List<String>> pkgIndex = new LinkedHashMap<>();
+                        if (testPlan.candidateTestsListing != null && !testPlan.candidateTestsListing.isBlank()) {
+                            for (String line : testPlan.candidateTestsListing.split("\\R")) {
+                                if (line == null || line.isBlank()) continue;
+                                String norm = line.replace('\\', '/');
+                                String rel = norm.replaceFirst("^src/test/java/", "");
+                                int slash = rel.lastIndexOf('/');
+                                String pkg = slash > 0 ? rel.substring(0, slash).replace('/', '.') : "(default)";
+                                String cls = rel.substring(rel.lastIndexOf('/') + 1).replaceAll("\\.java$", "");
+                                pkgIndex.computeIfAbsent(pkg, k -> new ArrayList<>()).add(cls);
+                            }
+                        }
+                        Map<String, String> fileToDiff = new LinkedHashMap<>();
+                        for (ChangedFile cf : changed) {
+                            String safe = shellQuote(cf.filename);
+                            String diff = runProcess(new String[]{"bash", "-lc", "git --no-pager diff --unified=0 -- " + safe + " | sed -n '1,200p' || true"});
+                            fileToDiff.put(cf.filename, diff == null ? "" : diff);
+                            if (fileToDiff.size() >= 80) break;
+                        }
+
+                        // Call LLMAssistedSelector.refine via reflection
+                        Object selObj = selClass
+                                .getMethod("refine", List.class, List.class, Map.class, Map.class)
+                                .invoke(null, testPlan.testClasses, changedFilesForSelector, pkgIndex, fileToDiff);
+
+                        if (selObj != null) {
+                            // Read fields from LLMAssistedSelector.Selection via reflection
+                            // Try public fields refinedClasses and rationale (per provided class)
+                            List<String> refined = null;
+                            String rationale = "";
+                            try {
+                                refined = (List<String>) selObj.getClass().getField("refinedClasses").get(selObj);
+                            } catch (Throwable ignored) {}
+                            try {
+                                Object r = selObj.getClass().getField("rationale").get(selObj);
+                                rationale = r == null ? "" : String.valueOf(r);
+                            } catch (Throwable ignored) {}
+                            if (refined != null && !refined.isEmpty()) {
+                                testPlan = new TestPlan(projectType, refined, testPlan.candidateTestsListing);
+                                llmSelectorApplied = true;
+                                llmSelectorRationale = rationale;
+                            }
+                        }
                     }
+                } catch (ClassNotFoundException cnf) {
+                    // LLMAssistedSelector not present: skip silently
+                } catch (Throwable t) {
+                    // Any reflection error: skip selector
                 }
-                Map<String, String> fileToDiff = new LinkedHashMap<>();
-                for (ChangedFile cf : changed) {
-                    String safe = shellQuote(cf.filename);
-                    String diff = runProcess(new String[]{"bash", "-lc", "git --no-pager diff --unified=0 -- " + safe + " | sed -n '1,200p' || true"});
-                    fileToDiff.put(cf.filename, diff == null ? "" : diff);
-                    if (fileToDiff.size() >= 80) break;
-                }
-                LLMAssistedSelector.Selection sel = LLMAssistedSelector.refine(
-                        testPlan.testClasses, changedFilesForSelector, pkgIndex, fileToDiff);
-                if (sel != null && sel.refinedClasses != null && !sel.refinedClasses.isEmpty()) {
-                    testPlan = new TestPlan(projectType, sel.refinedClasses, testPlan.candidateTestsListing);
-                }
-                llmSelectorRationale = (sel != null ? sel.rationale : "");
             }
 
             // 3) Affected API endpoints (Spring MVC)
@@ -158,7 +191,7 @@ public class PrChangeTestAnalyzer {
             String prUrl = serverUrl + "/" + repo + "/pull/" + prNum;
             StringBuilder body = new StringBuilder();
             body.append("🤖 PR Targeted Test Analyzer (Spring Boot enhanced + API endpoints");
-            if (LLMAssistedSelector.isEnabled()) body.append(" + LLM-assisted selection");
+            if (llmSelectorApplied) body.append(" + LLM-assisted selection");
             body.append(")\n\n");
             body.append("- PR: ").append(prUrl).append("\n");
             body.append("- Build tool: ").append(projectType).append("\n");
@@ -173,7 +206,7 @@ public class PrChangeTestAnalyzer {
                         .append(testPlan.candidateTestsListing).append("\n```\n\n");
             }
 
-            if (LLMAssistedSelector.isEnabled() && !isBlank(llmSelectorRationale)) {
+            if (llmSelectorApplied && !isBlank(llmSelectorRationale)) {
                 body.append("LLM-selected tests rationale:\n```\n")
                         .append(trimTo(llmSelectorRationale, 4000)).append("\n```\n\n");
             }
@@ -956,15 +989,5 @@ public class PrChangeTestAnalyzer {
     }
     private static int parseIntSafe(String s, int def) { try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; } }
     private static boolean isBlank(String s) { return s == null || s.trim().isEmpty(); }
-
-    // Small helper to detect if LLMAssistedSelector class is available at runtime (optional feature)
-    private static boolean isClassPresent(String simpleName) {
-        try {
-            // default package: just try to load by simple name
-            Class.forName(simpleName);
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
-    }
+    private static boolean isTruth(String s) { return "true".equalsIgnoreCase(String.valueOf(s).trim()); }
 }
