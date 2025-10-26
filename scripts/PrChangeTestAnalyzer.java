@@ -7,12 +7,16 @@
  *  - Parse Spring MVC annotations to build endpoints (class + method level).
  *  - De-duplicate candidate test files and endpoints; only show focused failure diagnostics on failures.
  *
- * Defaults requested:
+ * Defaults:
  *  - OpenRouter model default: meta-llama/llama-3.3-8b-instruct:free
  *  - FAIL_ON_TEST_FAILURE default: true
  *  - WORKFLOW_NAME default: "PR Targeted Test Analyzer"
  *  - Maven test command disables JUnit @Disabled via:
  *      -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition
+ *
+ * Optional local/self-hosted LLM:
+ *  - LLM_PROVIDER=openai to call any OpenAI-compatible /v1/chat/completions endpoint (e.g., Ollama/vLLM/LM Studio/llama.cpp).
+ *  - LLM_BASE_URL, LLM_MODEL, LLM_API_KEY control the local provider call.
  */
 import java.io.*;
 import java.net.URI;
@@ -40,10 +44,16 @@ public class PrChangeTestAnalyzer {
             String apiUrl = getenvOr("API_URL", "https://api.github.com");
             String workflowName = getenvOr("WORKFLOW_NAME", "PR Targeted Test Analyzer");
 
+            // LLM config: OpenRouter (default) and optional OpenAI-compatible local provider
             String orKey = getenvOr("OPENROUTER_API_KEY", "").trim();
             String orModel = getenvOr("OPENROUTER_MODEL", "meta-llama/llama-3.3-8b-instruct:free").trim();
             int llmMax = parseIntSafe(getenvOr("LLM_MAX_TOKENS", "800"), 800);
             boolean failOnTestFailure = "true".equalsIgnoreCase(getenvOr("FAIL_ON_TEST_FAILURE", "true"));
+
+            String llmProvider = getenvOr("LLM_PROVIDER", "openrouter").trim().toLowerCase(Locale.ROOT);
+            String llmBaseUrl = getenvOr("LLM_BASE_URL", "").trim(); // e.g. http://127.0.0.1:11434/v1
+            String llmApiKey  = getenvOr("LLM_API_KEY", "").trim();
+            String llmModel   = getenvOr("LLM_MODEL", "").trim();    // e.g. llama3.1:8b-instruct
 
             // 1) PR changed files
             List<ChangedFile> changed = listChangedFiles(repo, prNum);
@@ -90,10 +100,20 @@ public class PrChangeTestAnalyzer {
 
             String llmAnalysis;
             String llmContext = buildLLMPrompt(repo, prNum, baseSha, headSha, changed, testPlan, summary, failureDiagnostics);
-            if (!orKey.isBlank()) {
-                llmAnalysis = analyzeWithOpenRouter(orKey, orModel, llmContext, llmMax);
+
+            if ("openai".equals(llmProvider)) {
+                if (isBlank(llmBaseUrl) || isBlank(llmModel)) {
+                    llmAnalysis = "OpenAI-compatible provider is selected but LLM_BASE_URL or LLM_MODEL is missing.\n\n" +
+                            ruleBasedSuggestions(failureDiagnostics);
+                } else {
+                    llmAnalysis = analyzeWithOpenAICompatibleOrFallback(llmBaseUrl, llmApiKey, llmModel, llmContext, llmMax, failureDiagnostics);
+                }
             } else {
-                llmAnalysis = ruleBasedSuggestions(failureDiagnostics);
+                if (!orKey.isBlank()) {
+                    llmAnalysis = analyzeWithOpenRouter(orKey, orModel, llmContext, llmMax);
+                } else {
+                    llmAnalysis = ruleBasedSuggestions(failureDiagnostics);
+                }
             }
 
             // 7) Compose PR comment
@@ -156,19 +176,26 @@ public class PrChangeTestAnalyzer {
 
     // ========= Data models =========
     enum ProjectType { MAVEN, GRADLE, UNKNOWN }
-    static class ChangedFile { final String filename; final String status; ChangedFile(String f, String s){ filename=f; status=s; } }
+
+    static class ChangedFile {
+        final String filename; final String status;
+        ChangedFile(String f, String s){ filename=f; status=s; }
+    }
+
     static class TestPlan {
         final ProjectType projectType;
         final List<String> testClasses;          // simple class names to pass to runner
         final String candidateTestsListing;      // pretty listing (de-duplicated)
         TestPlan(ProjectType t, List<String> c, String l){ projectType=t; testClasses=c; candidateTestsListing=l==null?"":l; }
     }
+
     static class TestResult {
         final boolean executed; final int exitCode; final String command; final String log; final String tool;
         TestResult(boolean ex, int ec, String cmd, String lg, String tl){ executed=ex; exitCode=ec; command=cmd; log=lg; tool=tl; }
         static TestResult noTests(String msg){ return new TestResult(false,0,"(no tests executed)",msg,"(none)"); }
         static TestResult noProject(String msg){ return new TestResult(false,0,"(no project detected)",msg,"(none)"); }
     }
+
     static class Endpoint {
         final String httpMethod; final String path; final String controllerSimple; final String methodName; final String reason;
         Endpoint(String m, String p, String ctrl, String meth, String r){ httpMethod=m; path=p; controllerSimple=ctrl; methodName=meth; reason=r; }
@@ -612,7 +639,7 @@ public class PrChangeTestAnalyzer {
         }
     }
 
-    // ========= LLM or rule-based =========
+    // ========= LLM callers =========
     private static String analyzeWithOpenRouter(String key, String model, String prompt, int maxTokens) {
         try {
             HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
@@ -658,6 +685,60 @@ public class PrChangeTestAnalyzer {
         }
     }
 
+    private static String analyzeWithOpenAICompatibleOrFallback(String baseUrl, String apiKey, String model, String prompt, int maxTokens, String fallbackContext) {
+        try {
+            String url;
+            if (baseUrl.endsWith("/chat/completions")) {
+                url = baseUrl;
+            } else if (baseUrl.endsWith("/v1/")) {
+                url = baseUrl + "chat/completions";
+            } else if (baseUrl.endsWith("/v1")) {
+                url = baseUrl + "/chat/completions";
+            } else {
+                url = baseUrl + "/v1/chat/completions";
+            }
+
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build();
+            String body = """
+            {
+              "model": %s,
+              "messages": [
+                {"role": "system", "content": "You are a senior CI/CD debugging and testing assistant."},
+                {"role": "user", "content": %s}
+              ],
+              "max_tokens": %d,
+              "temperature": 0.2
+            }
+            """.formatted(jsonString(model), jsonString(prompt), maxTokens);
+
+            HttpRequest.Builder b = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(120))
+                    .header("Content-Type", "application/json");
+            if (!isBlank(apiKey)) b.header("Authorization", "Bearer " + apiKey);
+
+            HttpRequest request = b.POST(HttpRequest.BodyPublishers.ofString(body)).build();
+            HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            int status = resp.statusCode();
+            if (status >= 200 && status < 300) {
+                String content = extractJsonField(resp.body(), "content");
+                if (isBlank(content)) content = resp.body();
+                return "```\n" + content.trim() + "\n```";
+            } else if (status == 401 || status == 403) {
+                return "OpenAI-compatible " + status + " (invalid key or not provided). Falling back to rule-based suggestions.\n\n" + ruleBasedSuggestions(fallbackContext);
+            } else if (status == 404) {
+                return "OpenAI-compatible 404 (route/model not found). Check LLM_BASE_URL and LLM_MODEL.\n\n" + ruleBasedSuggestions(fallbackContext);
+            } else if (status == 429) {
+                return "OpenAI-compatible 429 (rate limit). Please retry later.\n\n" + ruleBasedSuggestions(fallbackContext);
+            } else {
+                return "OpenAI-compatible call failed: " + status + " " + resp.body() + "\n\n" + ruleBasedSuggestions(fallbackContext);
+            }
+        } catch (Exception e) {
+            return "OpenAI-compatible call error: " + e.getMessage() + "\n\n" + ruleBasedSuggestions(fallbackContext);
+        }
+    }
+
+    // ========= Prompt & rule-based fallback =========
     private static String buildLLMPrompt(String repo, String prNum, String baseSha, String headSha,
                                          List<ChangedFile> changed, TestPlan plan, String summary, String diagnostics) throws IOException, InterruptedException {
         String changedList = changed.stream().map(cf -> cf.status + " " + cf.filename).collect(Collectors.joining("\n"));
@@ -666,7 +747,7 @@ public class PrChangeTestAnalyzer {
             if (diffs.length() > 14_000) break;
             String safe = shellQuote(cf.filename);
             String out = runProcess(new String[]{"bash", "-lc", "git --no-pager diff --unified=0 -- " + safe + " | sed -n '1,200p' || true"});
-            if (!out.isBlank()) {
+            if (!isBlank(out)) {
                 diffs.append("\n=== DIFF: ").append(cf.filename).append(" ===\n")
                         .append(trimTo(out, 2000)).append("\n");
             }
@@ -815,7 +896,8 @@ public class PrChangeTestAnalyzer {
             escape = (c == '\\') && !escape;
             end++;
         }
-        if (end >= json.length()) return ""; String val = json.substring(startQuote + 1, end);
+        if (end >= json.length()) return "";
+        String val = json.substring(startQuote + 1, end);
         return val.replace("\\n", "\n").replace("\\\"", "\"");
     }
 
