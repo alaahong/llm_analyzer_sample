@@ -1,7 +1,7 @@
 /* Java 21 PR Targeted Test Analyzer with OpenRouter suggestions and rule-based fallback.
  * - On PR events, list changed source files.
  * - Heuristically map them to unit test files/classes (Java/Maven/Gradle focus), verify existence, and run only those tests.
- * - Summarize results and error highlights, then post a PR comment.
+ * - Summarize results and show focused failure snippets only when tests fail, then post a PR comment.
  * - If OPENROUTER_API_KEY is present, call OpenRouter to propose additional tests and fixes based on highlights.
  * - If LLM is unavailable, fall back to built-in rules for quick suggestions.
  *
@@ -42,7 +42,7 @@ public class PrChangeTestAnalyzer {
             String orKey = getenvOr("OPENROUTER_API_KEY", "").trim();
             String orModel = getenvOr("OPENROUTER_MODEL", "meta-llama/llama-3.3-8b-instruct:free").trim();
             int llmMax = parseIntSafe(getenvOr("LLM_MAX_TOKENS", "800"), 800);
-            boolean failOnTestFailure = "true".equalsIgnoreCase(getenvOr("FAIL_ON_TEST_FAILURE", "false"));
+            boolean failOnTestFailure = "true".equalsIgnoreCase(getenvOr("FAIL_ON_TEST_FAILURE", "true"));
 
             // 1) Gather PR file changes
             List<ChangedFile> changed = listChangedFiles(repo, prNum);
@@ -72,25 +72,34 @@ public class PrChangeTestAnalyzer {
                 intendedExit = 1; // mark for failing at the end
             }
 
-            // 4) Collect highlights from console + reports
-            String reportsTail = readTestReportsTail();
-            String combined = trimTo(testResult.log, 40_000) + "\n" + reportsTail;
-            String errorHighlights = extractErrorHighlights(combined, HIGHLIGHT_MAX_LINES);
-            String summary = summarizeResults(testResult, reportsTail);
+            // 4) Failure diagnostics: only when tests fail
+            String failureDiagnostics = "";
+            if (testResult.executed && testResult.exitCode != 0) {
+                failureDiagnostics = collectFailureDiagnostics();
+                if (isBlank(failureDiagnostics)) {
+                    // fallback to generic highlights from console + reports tail
+                    String reportsTail = readTestReportsTail();
+                    String combined = trimTo(testResult.log, 40_000) + "\n" + reportsTail;
+                    failureDiagnostics = extractErrorHighlights(combined, HIGHLIGHT_MAX_LINES);
+                }
+            }
 
-            // 5) Ask OpenRouter (optional) for analysis/suggestions based on diff+highlights
+            // 5) Summary and LLM suggestions
+            String reportsTailForSummary = readTestReportsTail();
+            String summary = summarizeResults(testResult, reportsTailForSummary);
+
             String llmAnalysis;
-            String llmContext = buildLLMPrompt(repo, prNum, baseSha, headSha, changed, testPlan, summary, errorHighlights);
+            String llmContext = buildLLMPrompt(repo, prNum, baseSha, headSha, changed, testPlan, summary, failureDiagnostics);
             if (!orKey.isBlank()) {
                 llmAnalysis = analyzeWithOpenRouter(orKey, orModel, llmContext, llmMax);
             } else {
-                llmAnalysis = ruleBasedSuggestions(errorHighlights);
+                llmAnalysis = ruleBasedSuggestions(failureDiagnostics);
             }
 
             // 6) Compose PR comment
             String prUrl = serverUrl + "/" + repo + "/pull/" + prNum;
             StringBuilder body = new StringBuilder();
-            body.append("🤖 PR Targeted Test Analyzer (OpenRouter)\n\n");
+            body.append("🤖 PR Targeted Test Analyzer\n\n");
             body.append("- PR: ").append(prUrl).append("\n");
             body.append("- Build tool: ").append(projectType).append("\n");
             body.append("- Selected tests (heuristics): ").append(testPlan.testClasses.isEmpty() ? "(none)" : testPlan.testClasses).append("\n");
@@ -106,9 +115,11 @@ public class PrChangeTestAnalyzer {
             }
 
             body.append("Test summary:\n```\n").append(summary).append("\n```\n\n");
-            if (!errorHighlights.isBlank()) {
-                body.append("Error highlights (first ").append(HIGHLIGHT_MAX_LINES).append(" lines):\n```txt\n")
-                        .append(errorHighlights).append("\n```\n\n");
+
+            // Only show diagnostics on failure
+            if (testResult.executed && testResult.exitCode != 0 && !isBlank(failureDiagnostics)) {
+                body.append("Failure diagnostics (focused snippets):\n```txt\n")
+                        .append(failureDiagnostics).append("\n```\n\n");
             }
 
             body.append("Analysis and suggestions:\n")
@@ -146,7 +157,7 @@ public class PrChangeTestAnalyzer {
     static class TestPlan {
         final ProjectType projectType;
         final List<String> testClasses; // simple class names to pass to runner
-        final String candidateTestsListing; // pretty listing
+        final String candidateTestsListing; // pretty listing (de-duplicated)
         TestPlan(ProjectType t, List<String> cls, String listing) {
             this.projectType = t; this.testClasses = cls; this.candidateTestsListing = listing == null ? "" : listing;
         }
@@ -206,7 +217,7 @@ public class PrChangeTestAnalyzer {
 
     private static TestPlan buildJavaTestPlan(List<ChangedFile> changed) throws IOException {
         Set<String> classNames = new LinkedHashSet<>();
-        StringBuilder listing = new StringBuilder();
+        LinkedHashSet<String> listingPaths = new LinkedHashSet<>(); // de-duplicate candidate paths
 
         for (ChangedFile cf : changed) {
             if (!cf.filename.endsWith(".java")) continue;
@@ -236,7 +247,7 @@ public class PrChangeTestAnalyzer {
                 }
 
                 for (String f : found) {
-                    listing.append(f).append("\n");
+                    listingPaths.add(f);
                     String simple = toSimpleClassNameFromPath(f, "src/test/java/");
                     if (!simple.isBlank()) classNames.add(simple);
                 }
@@ -244,13 +255,14 @@ public class PrChangeTestAnalyzer {
 
             // If a test file itself changed, include it
             if (cf.filename.startsWith("src/test/java/") && cf.filename.endsWith(".java")) {
-                listing.append(cf.filename).append("\n");
+                listingPaths.add(cf.filename);
                 String simple = toSimpleClassNameFromPath(cf.filename, "src/test/java/");
                 if (!simple.isBlank()) classNames.add(simple);
             }
         }
 
-        return new TestPlan(ProjectType.MAVEN, new ArrayList<>(classNames), listing.toString().trim());
+        String listing = listingPaths.stream().collect(Collectors.joining("\n"));
+        return new TestPlan(ProjectType.MAVEN, new ArrayList<>(classNames), listing);
     }
 
     private static String toSimpleClassNameFromPath(String path, String testRootPrefix) {
@@ -317,6 +329,86 @@ public class PrChangeTestAnalyzer {
         return sb.toString();
     }
 
+    // ---------------- Failure diagnostics (focused) ----------------
+    private static String collectFailureDiagnostics() throws IOException {
+        // Prefer JUnit XML details
+        List<String> snippets = new ArrayList<>();
+
+        // surefire/failsafe XML
+        collectJUnitXmlFailures(snippets, Path.of("target", "surefire-reports"));
+        collectJUnitXmlFailures(snippets, Path.of("target", "failsafe-reports"));
+        // Gradle test-results
+        collectJUnitXmlFailures(snippets, Path.of("build", "test-results", "test"));
+
+        // If no XML diagnostics, try surefire/failsafe text files
+        if (snippets.isEmpty()) {
+            collectSurefireTxtFailures(snippets, Path.of("target", "surefire-reports"));
+            collectSurefireTxtFailures(snippets, Path.of("target", "failsafe-reports"));
+        }
+
+        // Limit number and size
+        if (snippets.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        int limit = Math.min(3, snippets.size());
+        for (int i = 0; i < limit; i++) {
+            String s = snippets.get(i);
+            sb.append(s.length() > 3500 ? s.substring(0, 3500) + "\n...[truncated]...\n" : s);
+            if (i < limit - 1) sb.append("\n\n");
+        }
+        return sb.toString();
+    }
+
+    private static void collectJUnitXmlFailures(List<String> out, Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var walk = Files.walk(dir)) {
+            for (Path p : walk.filter(Files::isRegularFile).filter(x -> x.toString().endsWith(".xml")).toList()) {
+                String xml = Files.readString(p, StandardCharsets.UTF_8);
+                // Match <testcase ... name="..." classname="..."> ... <failure ...>...</failure> ... </testcase>
+                Pattern tc = Pattern.compile(
+                        "<testcase\\b[^>]*?classname=\"([^\"]*)\"[^>]*?name=\"([^\"]*)\"[^>]*?>([\\s\\S]*?)</testcase>",
+                        Pattern.CASE_INSENSITIVE);
+                Matcher mt = tc.matcher(xml);
+                while (mt.find()) {
+                    String cls = mt.group(1);
+                    String name = mt.group(2);
+                    String inner = mt.group(3);
+                    Matcher mf = Pattern.compile("<(failure|error)\\b[^>]*?(?:message=\"([^\"]*)\")?[^>]*?>([\\s\\S]*?)</\\1>",
+                            Pattern.CASE_INSENSITIVE).matcher(inner);
+                    if (mf.find()) {
+                        String kind = mf.group(1).toUpperCase(Locale.ROOT);
+                        String msg = Optional.ofNullable(mf.group(2)).orElse("").trim();
+                        String body = mf.group(3).trim();
+                        String snippet = "Test: " + cls + "#" + name + " [" + kind + "]\n"
+                                + (msg.isEmpty() ? "" : ("Message: " + msg + "\n"))
+                                + "Stack:\n" + trimTo(body, 2500);
+                        out.add(snippet);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void collectSurefireTxtFailures(List<String> out, Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var walk = Files.walk(dir)) {
+            for (Path p : walk.filter(Files::isRegularFile).filter(x -> x.toString().endsWith(".txt")).toList()) {
+                List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
+                Pattern marker = Pattern.compile("<<<\\s*(FAILURE|ERROR)\\s*!\\s*");
+                for (int i = 0; i < lines.size(); i++) {
+                    String ln = lines.get(i);
+                    if (marker.matcher(ln).find()) {
+                        // capture around the marker
+                        int start = Math.max(0, i - 5);
+                        int end = Math.min(lines.size(), i + 60);
+                        String block = String.join("\n", lines.subList(start, end));
+                        String snippet = p + ":\n" + block;
+                        out.add(snippet);
+                    }
+                }
+            }
+        }
+    }
+
     // ---------------- Step 5: OpenRouter or rules ----------------
     private static String analyzeWithOpenRouter(String key, String model, String prompt, int maxTokens) {
         try {
@@ -364,7 +456,7 @@ public class PrChangeTestAnalyzer {
     }
 
     private static String buildLLMPrompt(String repo, String prNum, String baseSha, String headSha,
-                                         List<ChangedFile> changed, TestPlan plan, String summary, String highlights) throws IOException, InterruptedException {
+                                         List<ChangedFile> changed, TestPlan plan, String summary, String diagnostics) throws IOException, InterruptedException {
         String changedList = changed.stream().map(cf -> cf.status + " " + cf.filename).collect(Collectors.joining("\n"));
         StringBuilder diffs = new StringBuilder();
         for (ChangedFile cf : changed) {
@@ -384,7 +476,7 @@ public class PrChangeTestAnalyzer {
                 "Changed files:\n" + changedList + "\n\n" +
                 "Heuristic selected test classes: " + plan.testClasses + "\n\n" +
                 "Test summary:\n" + summary + "\n\n" +
-                "Error highlights:\n" + highlights + "\n\n" +
+                "Failure diagnostics:\n" + (isBlank(diagnostics) ? "(none)" : diagnostics) + "\n\n" +
                 "Relevant diffs (truncated):\n" + diffs + "\n\n" +
                 "Task:\n" +
                 "1) Identify the most relevant unit tests to run (class names) and any that are missing but should exist.\n" +
@@ -426,7 +518,6 @@ public class PrChangeTestAnalyzer {
     // ---------------- Utilities ----------------
     private static String readTestReportsTail() throws IOException {
         StringBuilder sb = new StringBuilder();
-        // surefire/failsafe
         try (var walk = Files.walk(Path.of("."))) {
             for (Path p : walk.filter(Files::isRegularFile)
                     .filter(p -> p.toString().endsWith(".txt") &&
