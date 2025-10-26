@@ -28,7 +28,7 @@ public class UserService {
         // 验证用户是否存在且密码正确
         if (user != null && user.getPassword().equals(password)) {
             // 生成简单的会话ID（实际应用中应使用更安全的方式）
-            String sessionId = "not-session-" + System.currentTimeMillis() + "-" + username;
+            String sessionId = "session-" + System.currentTimeMillis() + "-" + username;
             sessionStore.put(sessionId, username);
             return sessionId;
         }

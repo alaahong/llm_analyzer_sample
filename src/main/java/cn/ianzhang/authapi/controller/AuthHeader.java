@@ -29,7 +29,7 @@ public class AuthHeader {
         public Object resolveArgument(MethodParameter parameter, ModelAndViewContainer mavContainer,
                                       NativeWebRequest webRequest, WebDataBinderFactory binderFactory) {
             HttpServletRequest request = webRequest.getNativeRequest(HttpServletRequest.class);
-            String sessionId = request != null ? request.getHeader("Token") : null;
+            String sessionId = request != null ? request.getHeader("Authorization") : null;
             return new AuthHeader(sessionId);
         }
     }
