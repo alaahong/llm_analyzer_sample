@@ -154,8 +154,8 @@ public class PrChangeTestAnalyzer {
                         .append(failureDiagnostics).append("\n```\n\n");
             }
 
-            body.append("Analysis and suggestions:\n")
-                    .append(llmAnalysis).append("\n");
+            // Task Analysis section: render raw markdown (no code fence)
+            body.append("Task Analysis:\n").append(llmAnalysis).append("\n");
 
             String finalBody = body.toString();
             if (finalBody.length() > BODY_MAX_CHARS) {
@@ -670,7 +670,7 @@ public class PrChangeTestAnalyzer {
             if (status >= 200 && status < 300) {
                 String content = extractJsonField(resp.body(), "content");
                 if (isBlank(content)) content = resp.body();
-                return "```\n" + content.trim() + "\n```";
+                return content.trim(); // return raw markdown (no code fence)
             } else if (status == 401 || status == 403) {
                 return "OpenRouter " + status + " (key invalid or insufficient scope). Falling back to rule-based suggestions.\n\n" + ruleBasedSuggestions(prompt);
             } else if (status == 404) {
@@ -723,7 +723,7 @@ public class PrChangeTestAnalyzer {
             if (status >= 200 && status < 300) {
                 String content = extractJsonField(resp.body(), "content");
                 if (isBlank(content)) content = resp.body();
-                return "```\n" + content.trim() + "\n```";
+                return content.trim(); // return raw markdown (no code fence)
             } else if (status == 401 || status == 403) {
                 return "OpenAI-compatible " + status + " (invalid key or not provided). Falling back to rule-based suggestions.\n\n" + ruleBasedSuggestions(fallbackContext);
             } else if (status == 404) {
@@ -787,7 +787,7 @@ public class PrChangeTestAnalyzer {
         if (sb.toString().equals("Fallback suggestions (rule-based):\n")) {
             sb.append("- No specific signature detected. Re-run selected tests with verbose logs and inspect diffs for edge cases.\n");
         }
-        return "```\n" + sb.toString().trim() + "\n```";
+        return sb.toString().trim(); // return raw markdown (no code fence)
     }
 
     // ========= PR comment & helpers =========
