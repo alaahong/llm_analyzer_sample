@@ -11,6 +11,18 @@ public class Response<T> {
         this.data = data;
     }
 
+    public static <T> Response<T> success(T data) {
+        return new Response<>(true, "success", data);
+    }
+
+    public static <T> Response<T> success(String message, T data) {
+        return new Response<>(true, message, data);
+    }
+
+    public static <T> Response<T> fail(String message) {
+        return new Response<>(false, message, null);
+    }
+
     public boolean isSuccess() {
         return success;
     }
@@ -33,17 +45,5 @@ public class Response<T> {
 
     public void setData(T data) {
         this.data = data;
-    }
-
-    public static <T> Response<T> success(T data) {
-        return new Response<>(true, "success", data);
-    }
-
-    public static <T> Response<T> success(String message, T data) {
-        return new Response<>(true, message, data);
-    }
-
-    public static <T> Response<T> fail(String message) {
-        return new Response<>(false, message, null);
     }
 }
