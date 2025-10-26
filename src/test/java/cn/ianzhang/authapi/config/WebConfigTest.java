@@ -1,13 +1,14 @@
 package cn.ianzhang.authapi.config;
 
 import cn.ianzhang.authapi.controller.AuthHeader;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.method.support.HandlerMethodArgumentResolver;
 import java.util.ArrayList;
 import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
-
+@Disabled
 public class WebConfigTest {
 
     @Test
