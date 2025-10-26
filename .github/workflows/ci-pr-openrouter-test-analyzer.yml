@@ -50,7 +50,7 @@ jobs:
           ANALYZER_MAX_HIGHLIGHTS: ${{ vars.ANALYZER_MAX_HIGHLIGHTS || '200' }}
           LLM_MAX_TOKENS: ${{ vars.LLM_MAX_TOKENS || '800' }}
           # Fail the job when targeted tests fail (default false)
-          FAIL_ON_TEST_FAILURE: ${{ vars.FAIL_ON_TEST_FAILURE || 'false' }}
+          FAIL_ON_TEST_FAILURE: ${{ vars.FAIL_ON_TEST_FAILURE || 'true' }}
         run: |
           java scripts/PrChangeTestAnalyzer.java
 
